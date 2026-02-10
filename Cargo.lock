@@ -1288,6 +1288,7 @@ dependencies = [
  "hex",
  "reqwest",
  "rig-core",
+ "schemars",
  "scraper",
  "serde",
  "serde_json",

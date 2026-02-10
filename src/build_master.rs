@@ -1,70 +1,75 @@
+use std::{fs, io, path::Path};
 
-
-use std::{fs, io};
-use anyhow::Result;
+use anyhow::{Context, Result};
+use pipelines::kb::{story_document, story_id, Story, StorySeed, UserSkillStore, DEFAULT_KB_PATH};
+use pipelines::llm::EMBEDDING_MODEL_NAME;
 use rig::{
-    OneOrMany,
     embeddings::Embedding,
     providers::openai,
-    vector_store::{in_memory_store::InMemoryVectorStore},
+    vector_store::in_memory_store::InMemoryVectorStore,
+    OneOrMany,
 };
 use rig::client::{EmbeddingsClient, ProviderClient};
 use rig::vector_store::request::VectorSearchRequest;
 use rig::vector_store::VectorStoreIndex;
-const SKILL_EMBEDDINGS_PATH: &str = "data/skill_embeddings.json";
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
-pub struct SkillDoc {
-    pub id: String,
-    pub title: String,
-    pub company: String,
-    pub position: String,
-    pub section: String,
-    pub story: String, // short proof / context from resume
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CachedSkillEmbedding {
-    pub id: String,
-    pub document: String,
-    pub embedding: Vec<f64>,
-}
-
-pub fn skill_text(skill: &SkillDoc) -> String {
-    format!("{} (as a {} at {}): {}", skill.title, skill.position, skill.company, skill.story)
-}
-
-pub fn load_skill_embeddings_from_file() -> Result<Vec<CachedSkillEmbedding>> {
-    let contents = match fs::read_to_string(SKILL_EMBEDDINGS_PATH) {
+fn load_kb() -> Result<UserSkillStore> {
+    let contents = match fs::read_to_string(DEFAULT_KB_PATH) {
         Ok(contents) => contents,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(UserSkillStore { skills: Vec::new() })
+        }
         Err(err) => return Err(err.into()),
     };
 
-    Ok(serde_json::from_str::<Vec<CachedSkillEmbedding>>(&contents)?)
+    Ok(serde_json::from_str::<UserSkillStore>(&contents)?)
 }
 
-pub fn save_skill_embeddings_to_file(entries: &[CachedSkillEmbedding]) -> Result<()> {
-    let json = serde_json::to_string_pretty(entries)?;
-    fs::write(SKILL_EMBEDDINGS_PATH, json)?;
+fn save_kb(store: &UserSkillStore) -> Result<()> {
+    let json = serde_json::to_string_pretty(store)?;
+    let out_path = Path::new(DEFAULT_KB_PATH);
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create kb dir: {}", parent.display()))?;
+        }
+    }
+    fs::write(out_path, json)?;
     Ok(())
 }
 
+async fn ensure_vectors(
+    store: &mut UserSkillStore,
+    embed_model: &impl rig::embeddings::EmbeddingModel,
+) -> Result<bool> {
+    let mut updated = false;
+    for story in &mut store.skills {
+        if story.vector.is_empty() {
+            let document = story_document(&story.company, &story.year, &story.text);
+            let embedding = embed_model.embed_text(&document).await?;
+            story.vector = embedding.vec;
+            updated = true;
+        }
+    }
+    Ok(updated)
+}
+
 pub async fn add_story_to_store(
-    skill: SkillDoc,
+    story: StorySeed,
     embed_model: &impl rig::embeddings::EmbeddingModel,
 ) -> Result<()> {
-    let mut cached = load_skill_embeddings_from_file()?;
-    let text = skill_text(&skill);
-    let embedding = embed_model.embed_text(&text.clone()).await?;
+    let mut store = load_kb()?;
+    let document = story_document(&story.company, &story.year, &story.text);
+    let embedding = embed_model.embed_text(&document).await?;
 
-    cached.push(CachedSkillEmbedding {
-        id: skill.id,
-        document: text,
-        embedding: embedding.vec,
+    store.skills.push(Story {
+        company: story.company,
+        year: story.year,
+        text: story.text,
+        vector: embedding.vec,
     });
 
-    save_skill_embeddings_to_file(&cached)?;
+    save_kb(&store)?;
     Ok(())
 }
 
@@ -73,17 +78,27 @@ pub async fn get_skills(job_text: String) -> Result<Vec<(f64, String, String)>> 
         .with_env_filter(tracing_subscriber::EnvFilter::new("rig=trace"))
         .init();
 
-    let openai_client = openai::Client::from_env();
-    let embed_model = openai_client.embedding_model("text-embedding-ada-002");
+    let mut store = load_kb()?;
+    if store.skills.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    let cached = load_skill_embeddings_from_file()?;
-    let documents = cached.into_iter().map(|entry| {
+    let openai_client = openai::Client::from_env();
+    let embed_model = openai_client.embedding_model(EMBEDDING_MODEL_NAME);
+
+    let updated = ensure_vectors(&mut store, &embed_model).await?;
+    if updated {
+        save_kb(&store)?;
+    }
+
+    let documents = store.skills.iter().map(|story| {
+        let document = story_document(&story.company, &story.year, &story.text);
         (
-            entry.id,
-            entry.document.clone(),
+            story_id(&story.company, &story.year, &story.text),
+            document.clone(),
             OneOrMany::one(Embedding {
-                document: entry.document,
-                vec: entry.embedding,
+                document,
+                vec: story.vector.clone(),
             }),
         )
     });
@@ -91,7 +106,6 @@ pub async fn get_skills(job_text: String) -> Result<Vec<(f64, String, String)>> 
     let vector_store: InMemoryVectorStore<String> =
         InMemoryVectorStore::from_documents_with_ids(documents);
 
-    // Build index and agent
     let index = vector_store.index(embed_model);
 
     let req = VectorSearchRequest::builder()
