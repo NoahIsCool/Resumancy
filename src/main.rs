@@ -15,16 +15,31 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 const MAX_SKILL_TURNS: usize = 4;
-const SKILL_PLAN_PREAMBLE: &str = r#"Role: You are a hiring manager. Given a job posting and retrieved evidence from a resume knowledge base, identify skills required by the posting, and how well the candidate satisfies each skill requirement. Identify every key word and industry skill mentioned. Be sure to "Read between the lines" to include skills that are implied, but not explicitly mentioned. For example, A role as an "AI Researger" would likely faveor a graduate degree in AI, and even though it is not explicitly mentioned, it would likely prefer experience pubishing research papers. Be sure to be very thurough and candid.
+const JOB_POST_PREAMBLE: &str = r#"Role: You are a hiring manager responsible for digitizing job roles. Given a job posting, identify the attributes or skills required by the posting. Identify every key word and industry skill mentioned. Be sure to "Read between the lines" to include skills that are implied, but not explicitly mentioned. For example, A role as an "AI Researger" would likely faveor a graduate degree in AI, and even though it is not explicitly mentioned, it would likely prefer experience pubishing research papers.
 
-For each skill, return a struct with the following fields:
-- title of the skill
-- ranking from 0-9 of how nessasery the skill is to the job posting. 0 is not needed at all, 9 is a skill absolutely required, and anything less than 5 is simply nice to have.
-- a ranking from 0-9 of how well the candidate satisfies the skill requirement. 0 is not listed and 9 satisfies the skill requirement fully.
-- short description of the skill area.
-- a short justifcation of the candidate's ranking in this skill area.
+For each skill, return:
+- title: short label of the skill
+- description: 1-2 sentences describing what the skill entails in this role
+- need: ranking from 0-9 of how nessasery the skill is to the job posting. 0 is not needed at all, 9 is a skill absolutely required, and anything less than 5 is simply nice to have.
+- skill_description: short phrase (3-8 words) describing the skill area
+"#;
 
+const SKILL_PLAN_PREAMBLE: &str = r#"You are a hiring manager. Compare an explicit set of parsed needed skills against a knowledge base of applicant skills to identify how well the candidate satisfies each requirement.
 
+Rules:
+- Use only the provided JOB NEEDS list as the authoritative set of skills. Do not add, remove, or rename skills.
+- Copy title, need, description, and skill_description verbatim from JOB NEEDS.
+- Provide suitability and justification based only on the retrieved evidence.
+- If there is no evidence, set suitability low and explain the gap concisely.
+- Preserve the same ordering as JOB NEEDS.
+
+Give a summary of the condidate's sutiblity for the role. Then, for each skill, return a struct with the following fields:
+- title (copied verbatim from JOB NEEDS)
+- description (copied verbatim from JOB NEEDS)
+- need (copied verbatim from JOB NEEDS)
+- skill_description (copied verbatim from JOB NEEDS)
+- suitability (0-9)
+- justification (brief, evidence-based)
 "#;
 
 const STORY_ASSESS_PREAMBLE: &str = r#"You are a resume coach.
@@ -40,7 +55,22 @@ Rules:
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
 #[schemars(deny_unknown_fields)]
+struct JobNeeds {
+    skills: Vec<Need>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[schemars(deny_unknown_fields)]
+struct Need {
+    title: String, // title of the skill
+    description: String, // short description of the skill area.
+    need: u8, //ranking from 0-9 of how necessary the skill is
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[schemars(deny_unknown_fields)]
 struct SkillFocusList {
+    summary: String,
     skills: Vec<SkillNeed>,
 }
 
@@ -244,6 +274,24 @@ async fn main() -> Result<()> {
     let embed_model = openai_client.embedding_model(EMBEDDING_MODEL_NAME);
     let completion_model = openai_client.completion_model(MODEL_NAME);
 
+    // 3) Identify skill gaps with structured outputs
+    let job_prompt = format!("JOB POSTING:\n{}\n", job_text);
+
+    let job_needs: JobNeeds = prompt_structured(
+        &completion_model,
+        JOB_POST_PREAMBLE,
+        &job_prompt,
+        "job_needs_list",
+    ).await?;
+
+    let job_needs_json =
+        serde_json::to_string_pretty(&job_needs).context("failed to serialize job needs")?;
+    println!("\n=== Job Needs ===");
+    for (idx, skill) in job_needs.skills.iter().enumerate() {
+        // println!("{}", skill);
+        println!("{}. {}{:?}", idx + 1, skill.need, skill.title);
+        println!("\tdescription: {}", skill.description);
+    }
     let matches = build_master::get_skills(job_text.clone()).await?;
     let context = matches
         .iter()
@@ -253,8 +301,8 @@ async fn main() -> Result<()> {
 
     // 3) Identify skill gaps with structured outputs
     let skill_plan_prompt = format!(
-        "JOB POSTING:\n{}\n\nRETRIEVED EVIDENCE:\n{}\n",
-        job_text, context
+        "JOB NEEDS:\n{}\n\nRETRIEVED EVIDENCE:\n{}\n",
+        job_needs_json, context
     );
 
     let skill_plan: SkillFocusList = prompt_structured(
@@ -271,6 +319,7 @@ async fn main() -> Result<()> {
     }
 
     println!("\n=== Skill Focus Areas ===");
+    println!("Summary: {}\n\n", skill_plan.summary);
     for (idx, skill) in skill_plan.skills.iter().enumerate() {
         // println!("{}", skill);
         println!("{}. {:?}", idx + 1, skill.title);
