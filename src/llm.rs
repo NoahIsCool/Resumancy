@@ -64,3 +64,18 @@ where
         .with_context(|| format!("failed to parse structured output for {schema_name}"))?;
     Ok(parsed)
 }
+
+pub async fn prompt_text<M>(model: &M, preamble: &str, prompt: &str) -> Result<String>
+where
+    M: CompletionModel + Clone,
+{
+    let response = model
+        .completion_request(prompt)
+        .preamble(preamble.to_string())
+        .temperature(0.0)
+        .send()
+        .await
+        .context("prompt failed")?;
+
+    text_from_choice(response.choice)
+}

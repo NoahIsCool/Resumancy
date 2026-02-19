@@ -4,10 +4,11 @@ use std::{
     env,
     fs,
     io::{self, BufRead, Write},
+    process::Command,
 };
 use anyhow::{anyhow, Context, Result};
 use pipelines::kb::StorySeed;
-use pipelines::llm::{prompt_structured, EMBEDDING_MODEL_NAME, MODEL_NAME};
+use pipelines::llm::{prompt_structured, prompt_text, EMBEDDING_MODEL_NAME, MODEL_NAME};
 use rig::client::{CompletionClient, EmbeddingsClient, ProviderClient};
 use rig::completion::CompletionModel;
 use rig::providers::openai;
@@ -15,6 +16,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 const MAX_SKILL_TURNS: usize = 4;
+const MAX_LATEX_FIXES: usize = 3;
 const JOB_POST_PREAMBLE: &str = r#"Role: You are a hiring manager responsible for digitizing job roles. Given a job posting, identify the attributes or skills required by the posting. Identify every key word and industry skill mentioned. Be sure to "Read between the lines" to include skills that are implied, but not explicitly mentioned. For example, A role as an "AI Researger" would likely faveor a graduate degree in AI, and even though it is not explicitly mentioned, it would likely prefer experience pubishing research papers.
 
 For each skill, return:
@@ -52,6 +54,66 @@ Rules:
 - If all required fields are present, set action to "save_story".
 - missing_fields should list any missing required fields.
 - If a question is not needed, set its field to an empty string."#;
+
+const RESUME_BUILD_PREAMBLE: &str = r#"You are a resume writer. Build a tailored resume in LaTeX using the provided template.
+Rules:
+- Use only facts from JOB DESCRIPTION, KNOWLEDGE BASE, and STARTER RESUME.
+- Do not invent employers, titles, dates, degrees, or metrics.
+- Prefer KNOWLEDGE BASE for experience details; use STARTER RESUME for biographical/contact/education details if present.
+- If a detail is missing, omit it rather than guessing.
+- Focus on role fit from the job description.
+- Keep bullet points concise and impact-focused.
+- Output only valid LaTeX; no commentary or markdown."#;
+
+const RESUME_FIX_PREAMBLE: &str = r#"You are a LaTeX build fixer.
+Given a LaTeX document and compiler output, return a corrected full LaTeX document that compiles cleanly.
+Rules:
+- Preserve the original content and meaning; fix only syntax, escaping, and formatting issues.
+- Prefer minimal edits.
+- Output only LaTeX; no commentary or markdown."#;
+
+const RESUME_TEMPLATE_LATEX: &str = r#"\documentclass[11pt]{article}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{titlesec}
+\titleformat{\section}{\large\bfseries}{}{0em}{}[\titlerule]
+
+\begin{document}
+\begin{center}
+{\LARGE \textbf{<NAME>}}\\
+<LOCATION> \textbar <EMAIL> \textbar <PHONE> \textbar \href{<LINKEDIN_URL>}{LinkedIn}
+\end{center}
+
+\section*{Summary}
+<SUMMARY>
+
+\section*{Experience}
+% Repeat this block per role.
+\textbf{<COMPANY>} --- <TITLE> \hfill <LOCATION>\\
+\textit{<DATES>}\\
+\begin{itemize}[leftmargin=*]
+\item <IMPACT_BULLET>
+\item <IMPACT_BULLET>
+\end{itemize}
+
+\section*{Projects}
+% Repeat this block per project if applicable.
+\textbf{<PROJECT_NAME>} --- <ROLE_OR_CONTEXT> \hfill <DATES>\\
+\begin{itemize}[leftmargin=*]
+\item <IMPACT_BULLET>
+\end{itemize}
+
+\section*{Education}
+\textbf{<SCHOOL>} --- <DEGREE> \hfill <DATES>\\
+<DETAILS>
+
+\section*{Skills}
+\textbf{Languages:} <LANGUAGES>\\
+\textbf{Tools:} <TOOLS>\\
+\textbf{Domains:} <DOMAINS>
+
+\end{document}"#;
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
 #[schemars(deny_unknown_fields)]
@@ -111,8 +173,55 @@ struct StoryAssessment {
     parsed_story: ParsedStory,
 }
 
+struct LatexCompileResult {
+    log: String,
+    has_warning: bool,
+    has_error: bool,
+    success: bool,
+}
+
 fn normalize_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn tail_lines(input: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = input.lines().collect();
+    if lines.len() <= max_lines {
+        return input.to_string();
+    }
+    lines[lines.len().saturating_sub(max_lines)..].join("\n")
+}
+
+fn compile_latex(path: &str) -> Result<LatexCompileResult> {
+    let output = Command::new("pdflatex")
+        .arg("-interaction=nonstopmode")
+        .arg("-halt-on-error")
+        .arg("-file-line-error")
+        .arg(path)
+        .output()
+        .context("failed to run pdflatex")?;
+
+    let mut log = String::new();
+    log.push_str(&String::from_utf8_lossy(&output.stdout));
+    if !output.stderr.is_empty() {
+        if !log.ends_with('\n') {
+            log.push('\n');
+        }
+        log.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+
+    let has_warning = log.contains("LaTeX Warning");
+    let has_error = !output.status.success()
+        || log.lines().any(|line| line.starts_with('!'))
+        || log.contains("Emergency stop")
+        || log.contains("Undefined control sequence");
+
+    Ok(LatexCompileResult {
+        log,
+        has_warning,
+        has_error,
+        success: output.status.success(),
+    })
 }
 
 fn missing_fields(parsed: &ParsedStory) -> Vec<String> {
@@ -171,7 +280,7 @@ fn adjacent_fallback_question(skill: &SkillNeed) -> String {
     )
 }
 
-async fn collect_story_for_skill<M>(model: &M, skill: &SkillNeed) -> Result<ParsedStory>
+async fn collect_story_for_skill<M>(model: &M, skill: &SkillNeed) -> Result<Option<ParsedStory>>
 where
     M: CompletionModel + Clone,
 {
@@ -185,6 +294,9 @@ Finish with an empty line."
     io::stdout().flush().ok();
 
     let mut combined_input = read_multiline()?;
+    if combined_input.trim().is_empty() {
+        return Ok(None);
+    }
 
     for turn in 0..MAX_SKILL_TURNS {
         let assessment_prompt = format!(
@@ -197,8 +309,7 @@ Finish with an empty line."
             STORY_ASSESS_PREAMBLE,
             &assessment_prompt,
             "story_assessment",
-        )
-        .await?;
+        ).await?;
 
         let computed_missing = missing_fields(&assessment.parsed_story);
         let mut missing_fields = assessment.missing_fields.clone();
@@ -214,7 +325,7 @@ Finish with an empty line."
         }
 
         if matches!(action, NextAction::SaveStory) {
-            return Ok(assessment.parsed_story);
+            return Ok(Some(assessment.parsed_story));
         }
 
         if turn + 1 >= MAX_SKILL_TURNS {
@@ -245,6 +356,9 @@ Finish with an empty line."
         println!("\n{}\n", question);
         io::stdout().flush().ok();
         let answer = read_multiline()?;
+        if answer.trim().is_empty() {
+            return Ok(None);
+        }
         let label = match action {
             NextAction::AskAdjacent => "Adjacent experience answer",
             _ => "Follow-up answer",
@@ -260,14 +374,24 @@ Finish with an empty line."
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1) Load job posting text
-    let job_path = env::args()
-        .nth(1)
-        .ok_or_else(|| anyhow!("usage: cargo run -- <job_text_file>"))?;
+    let args: Vec<String> = env::args().collect();
 
-    let job_raw = fs::read_to_string(&job_path)
+    // 1) Load job posting text
+    let job_path = args
+        .get(1)
+        .ok_or_else(|| anyhow!("usage: cargo run -- <job_text_file> [starter_resume_file]"))?;
+
+    let job_raw = fs::read_to_string(job_path)
         .with_context(|| format!("failed to read file: {}", job_path))?;
     let job_text = normalize_whitespace(&job_raw);
+
+    let starter_resume = args
+        .get(2)
+        .map(|path| {
+            fs::read_to_string(path)
+                .with_context(|| format!("failed to read file: {}", path))
+        })
+        .transpose()?;
 
     // 2) Load knowledge base + retrieve context
     let openai_client = openai::Client::from_env();
@@ -340,6 +464,10 @@ async fn main() -> Result<()> {
         );
     
         let parsed = collect_story_for_skill(&completion_model, skill).await?;
+        let Some(parsed) = parsed else {
+            println!("Skipped");
+            continue;
+        };
         let story = StorySeed {
             company: parsed.company,
             year: parsed.year,
@@ -350,5 +478,80 @@ async fn main() -> Result<()> {
         println!("Saved");
     }
 
+    let kb_docs = build_master::list_story_documents()?;
+    let kb_context = if kb_docs.is_empty() {
+        "None.".to_string()
+    } else {
+        kb_docs
+            .iter()
+            .map(|doc| format!("- {doc}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let starter_resume = starter_resume
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "None provided.".to_string());
+
+    let resume_prompt = format!(
+        "JOB DESCRIPTION:\n{}\n\nKNOWLEDGE BASE:\n{}\n\nSTARTER RESUME:\n{}\n\nTEMPLATE:\n{}\n",
+        job_raw, kb_context, starter_resume, RESUME_TEMPLATE_LATEX
+    );
+
+    let mut resume_latex =
+        prompt_text(&completion_model, RESUME_BUILD_PREAMBLE, &resume_prompt).await?;
+    let output_tex = "generated_resume.tex";
+
+    for attempt in 0..=MAX_LATEX_FIXES {
+        fs::write(output_tex, &resume_latex)
+            .with_context(|| format!("failed to write resume to {}", output_tex))?;
+        println!("\nWrote LaTeX resume to {}", output_tex);
+
+        let compile = compile_latex(output_tex)?;
+        if compile.success && !compile.has_warning && !compile.has_error {
+            println!("Wrote PDF resume to generated_resume.pdf");
+            break;
+        }
+
+        fs::write("generated_resume.compile.log", &compile.log).ok();
+
+        if attempt == MAX_LATEX_FIXES {
+            if compile.has_error {
+                return Err(anyhow!(
+                    "pdflatex failed after {} attempts. See generated_resume.compile.log",
+                    attempt + 1
+                ));
+            }
+            println!(
+                "LaTeX compiled with warnings after {} attempts. See generated_resume.compile.log",
+                attempt + 1
+            );
+            println!("Wrote PDF resume to generated_resume.pdf");
+            break;
+        }
+
+        let issue = match (compile.has_error, compile.has_warning) {
+            (true, true) => "errors and warnings",
+            (true, false) => "errors",
+            (false, true) => "warnings",
+            (false, false) => "issues",
+        };
+        println!(
+            "LaTeX compilation reported {}. Attempting auto-fix ({}/{})...",
+            issue,
+            attempt + 1,
+            MAX_LATEX_FIXES + 1
+        );
+
+        let compile_tail = tail_lines(&compile.log, 200);
+        let fix_prompt = format!(
+            "LATEX DOCUMENT:\n{}\n\nCOMPILER OUTPUT:\n{}\n",
+            resume_latex, compile_tail
+        );
+        resume_latex = prompt_text(&completion_model, RESUME_FIX_PREAMBLE, &fix_prompt).await?;
+    }
+
+    l
     Ok(())
 }

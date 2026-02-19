@@ -119,6 +119,16 @@ pub async fn get_skills(job_text: String) -> Result<Vec<(f64, String, String)>> 
     Ok(matches)
 }
 
+pub fn list_story_documents() -> Result<Vec<String>> {
+    let store = load_kb()?;
+    let documents = store
+        .skills
+        .iter()
+        .map(|story| story_document(&story.company, &story.year, &story.text))
+        .collect();
+    Ok(documents)
+}
+
 #[cfg(test)]
 mod tests {
     use super::get_skills;
