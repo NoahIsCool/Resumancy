@@ -6,12 +6,14 @@ use std::{
     io::{self, BufRead, Write},
     process::Command,
 };
+use std::collections::HashMap;
 use anyhow::{anyhow, Context, Result};
-use pipelines::kb::StorySeed;
-use pipelines::llm::{prompt_structured, prompt_text, EMBEDDING_MODEL_NAME, MODEL_NAME};
-use rig::client::{CompletionClient, EmbeddingsClient, ProviderClient};
+use pipelines::kb::{EducationEntry, JobEntry, ProfileLink, StorySeed, UserProfile};
+use pipelines::llm::{
+    openai_client_from_env, prompt_structured, prompt_text, EMBEDDING_MODEL_NAME, MODEL_NAME,
+};
+use rig::client::{CompletionClient, EmbeddingsClient};
 use rig::completion::CompletionModel;
-use rig::providers::openai;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -57,9 +59,9 @@ Rules:
 
 const RESUME_BUILD_PREAMBLE: &str = r#"You are a resume writer. Build a tailored resume in LaTeX using the provided template.
 Rules:
-- Use only facts from JOB DESCRIPTION, KNOWLEDGE BASE, and STARTER RESUME.
+- Use only facts from JOB DESCRIPTION, KNOWLEDGE BASE, USER PROFILE, and STARTER RESUME.
 - Do not invent employers, titles, dates, degrees, or metrics.
-- Prefer KNOWLEDGE BASE for experience details; use STARTER RESUME for biographical/contact/education details if present.
+- Prefer KNOWLEDGE BASE for experience details; use USER PROFILE for biographical/contact/education details; use STARTER RESUME for any missing details if present.
 - If a detail is missing, omit it rather than guessing.
 - Focus on role fit from the job description.
 - Keep bullet points concise and impact-focused.
@@ -182,6 +184,135 @@ struct LatexCompileResult {
 
 fn normalize_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn read_required_line(prompt: &str) -> Result<String> {
+    loop {
+        print!("{prompt}");
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        let bytes = io::stdin().read_line(&mut line)?;
+        if bytes == 0 {
+            return Err(anyhow!("stdin closed while reading input"));
+        }
+        let value = line.trim_end_matches(&['\r', '\n'][..]).to_string();
+        if !value.trim().is_empty() {
+            return Ok(value);
+        }
+        println!("Value cannot be empty.");
+    }
+}
+
+fn read_optional_line(prompt: &str) -> Result<Option<String>> {
+    print!("{prompt}");
+    io::stdout().flush().ok();
+    let mut line = String::new();
+    let bytes = io::stdin().read_line(&mut line)?;
+    if bytes == 0 {
+        return Ok(None);
+    }
+    let value = line.trim_end_matches(&['\r', '\n'][..]).to_string();
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
+fn collect_user_profile() -> Result<UserProfile> {
+    println!("\n=== User profile ===");
+    let name = read_required_line("Full name: ")?;
+    let location = read_required_line("Location: ")?;
+    let email = read_required_line("Email: ")?;
+    let phone = read_required_line("Phone number: ")?;
+
+    println!("\n--- Relevant links (e.g., GitHub, LinkedIn) ---");
+    let mut links = Vec::new();
+    loop {
+        let label = read_optional_line("Link label (blank to finish): ")?;
+        let Some(label) = label else { break };
+        let url = read_required_line(&format!("URL for {}: ", label))?;
+        links.push(ProfileLink { label, url });
+    }
+
+    println!("\n--- Education ---");
+    let mut education = Vec::new();
+    loop {
+        let degree = read_optional_line("Degree title (blank to finish): ")?;
+        let Some(degree) = degree else { break };
+        let graduation_date = read_required_line("Graduation date: ")?;
+        education.push(EducationEntry {
+            degree,
+            graduation_date,
+        });
+    }
+
+    println!("\n--- Job history ---");
+    let mut jobs = Vec::new();
+    loop {
+        let company = read_optional_line("Company name (blank to finish): ")?;
+        let Some(company) = company else { break };
+        let title = read_required_line("Job title: ")?;
+        let job_location = read_required_line("Job location: ")?;
+        let start_date = read_required_line("Start date: ")?;
+        let end_date = read_required_line("End date (or Present): ")?;
+        jobs.push(JobEntry {
+            company,
+            title,
+            location: job_location,
+            start_date,
+            end_date,
+        });
+    }
+
+    Ok(UserProfile {
+        name,
+        location,
+        email,
+        phone,
+        links,
+        education,
+        jobs,
+    })
+}
+
+fn format_user_profile(profile: &UserProfile) -> String {
+    let mut out = Vec::new();
+    out.push(format!("Name: {}", profile.name));
+    out.push(format!("Location: {}", profile.location));
+    out.push(format!("Email: {}", profile.email));
+    out.push(format!("Phone: {}", profile.phone));
+
+    if profile.links.is_empty() {
+        out.push("Links: None.".to_string());
+    } else {
+        out.push("Links:".to_string());
+        for link in &profile.links {
+            out.push(format!("- {}: {}", link.label, link.url));
+        }
+    }
+
+    if profile.education.is_empty() {
+        out.push("Education: None.".to_string());
+    } else {
+        out.push("Education:".to_string());
+        for edu in &profile.education {
+            out.push(format!("- {} (Graduation: {})", edu.degree, edu.graduation_date));
+        }
+    }
+
+    if profile.jobs.is_empty() {
+        out.push("Job History: None.".to_string());
+    } else {
+        out.push("Job History:".to_string());
+        for job in &profile.jobs {
+            out.push(format!(
+                "- {} — {}, {} ({} to {})",
+                job.company, job.title, job.location, job.start_date, job.end_date
+            ));
+        }
+    }
+
+    out.join("\n")
 }
 
 fn tail_lines(input: &str, max_lines: usize) -> String {
@@ -394,13 +525,14 @@ async fn main() -> Result<()> {
         .transpose()?;
 
     // 2) Load knowledge base + retrieve context
-    let openai_client = openai::Client::from_env();
+    let openai_client = openai_client_from_env()?;
     let embed_model = openai_client.embedding_model(EMBEDDING_MODEL_NAME);
     let completion_model = openai_client.completion_model(MODEL_NAME);
 
     // 3) Identify skill gaps with structured outputs
     let job_prompt = format!("JOB POSTING:\n{}\n", job_text);
 
+    eprintln!("Requesting job needs from {MODEL_NAME}...");
     let job_needs: JobNeeds = prompt_structured(
         &completion_model,
         JOB_POST_PREAMBLE,
@@ -494,9 +626,20 @@ async fn main() -> Result<()> {
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| "None provided.".to_string());
 
+    let user_profile = match build_master::get_user_profile()? {
+        Some(profile) => profile,
+        None => {
+            println!("\nNo user profile found in knowledge base. Let's add it.");
+            let profile = collect_user_profile()?;
+            build_master::set_user_profile(profile.clone())?;
+            profile
+        }
+    };
+    let user_profile_context = format_user_profile(&user_profile);
+
     let resume_prompt = format!(
-        "JOB DESCRIPTION:\n{}\n\nKNOWLEDGE BASE:\n{}\n\nSTARTER RESUME:\n{}\n\nTEMPLATE:\n{}\n",
-        job_raw, kb_context, starter_resume, RESUME_TEMPLATE_LATEX
+        "JOB DESCRIPTION:\n{}\n\nKNOWLEDGE BASE:\n{}\n\nUSER PROFILE:\n{}\n\nSTARTER RESUME:\n{}\n\nTEMPLATE:\n{}\n",
+        job_raw, kb_context, user_profile_context, starter_resume, RESUME_TEMPLATE_LATEX
     );
 
     let mut resume_latex =
@@ -552,6 +695,5 @@ async fn main() -> Result<()> {
         resume_latex = prompt_text(&completion_model, RESUME_FIX_PREAMBLE, &fix_prompt).await?;
     }
 
-    l
     Ok(())
 }

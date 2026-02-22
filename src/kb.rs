@@ -14,6 +14,42 @@ pub struct StorySeed {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
 #[schemars(deny_unknown_fields)]
+pub struct ProfileLink {
+    pub label: String,
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[schemars(deny_unknown_fields)]
+pub struct EducationEntry {
+    pub degree: String,
+    pub graduation_date: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[schemars(deny_unknown_fields)]
+pub struct JobEntry {
+    pub company: String,
+    pub title: String,
+    pub location: String,
+    pub start_date: String,
+    pub end_date: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[schemars(deny_unknown_fields)]
+pub struct UserProfile {
+    pub name: String,
+    pub location: String,
+    pub email: String,
+    pub phone: String,
+    pub links: Vec<ProfileLink>,
+    pub education: Vec<EducationEntry>,
+    pub jobs: Vec<JobEntry>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[schemars(deny_unknown_fields)]
 pub struct UserSkillStoreSeed {
     pub skills: Vec<StorySeed>,
 }
@@ -32,6 +68,8 @@ pub struct Story {
 #[schemars(deny_unknown_fields)]
 pub struct UserSkillStore {
     pub skills: Vec<Story>,
+    #[serde(default)]
+    pub user_profile: Option<UserProfile>,
 }
 
 pub fn story_document(company: &str, year: &str, text: &str) -> String {

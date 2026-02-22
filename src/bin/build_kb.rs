@@ -2,10 +2,9 @@ use std::{env, fs, path::Path};
 
 use anyhow::{anyhow, Context, Result};
 use pipelines::kb::{story_document, Story, UserSkillStore, UserSkillStoreSeed, DEFAULT_KB_PATH};
-use pipelines::llm::{prompt_structured, EMBEDDING_MODEL_NAME, MODEL_NAME};
-use rig::client::{CompletionClient, EmbeddingsClient, ProviderClient};
+use pipelines::llm::{openai_client_from_env, prompt_structured, EMBEDDING_MODEL_NAME, MODEL_NAME};
+use rig::client::{CompletionClient, EmbeddingsClient};
 use rig::embeddings::EmbeddingModel;
-use rig::providers::openai;
 
 const KB_PREAMBLE: &str = r#"Role: You are a resume parsing assistant.
 Goal: Build an initial skills knowledge base from the resume.
@@ -33,10 +32,11 @@ async fn main() -> Result<()> {
     }
 
     let prompt = format!("RESUME:\n{}\n", resume_raw);
-    let openai_client = openai::Client::from_env();
+    let openai_client = openai_client_from_env()?;
     let completion_model = openai_client.completion_model(MODEL_NAME);
     let embed_model = openai_client.embedding_model(EMBEDDING_MODEL_NAME);
 
+    eprintln!("Parsing resume with {MODEL_NAME}...");
     let seed_store: UserSkillStoreSeed =
         prompt_structured(&completion_model, KB_PREAMBLE, &prompt, "user_skill_store_seed").await?;
     let mut skills = Vec::with_capacity(seed_store.skills.len());
@@ -50,7 +50,10 @@ async fn main() -> Result<()> {
             vector: embedding.vec,
         });
     }
-    let store = UserSkillStore { skills };
+    let store = UserSkillStore {
+        skills,
+        user_profile: None,
+    };
 
     let out_path = Path::new(&output_path);
     if let Some(parent) = out_path.parent() {

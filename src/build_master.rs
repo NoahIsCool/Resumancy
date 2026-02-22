@@ -1,15 +1,16 @@
 use std::{fs, io, path::Path};
 
 use anyhow::{Context, Result};
-use pipelines::kb::{story_document, story_id, Story, StorySeed, UserSkillStore, DEFAULT_KB_PATH};
-use pipelines::llm::EMBEDDING_MODEL_NAME;
+use pipelines::kb::{
+    story_document, story_id, Story, StorySeed, UserProfile, UserSkillStore, DEFAULT_KB_PATH,
+};
+use pipelines::llm::{openai_client_from_env, EMBEDDING_MODEL_NAME};
 use rig::{
     embeddings::Embedding,
-    providers::openai,
     vector_store::in_memory_store::InMemoryVectorStore,
     OneOrMany,
 };
-use rig::client::{EmbeddingsClient, ProviderClient};
+use rig::client::EmbeddingsClient;
 use rig::vector_store::request::VectorSearchRequest;
 use rig::vector_store::VectorStoreIndex;
 
@@ -17,7 +18,10 @@ fn load_kb() -> Result<UserSkillStore> {
     let contents = match fs::read_to_string(DEFAULT_KB_PATH) {
         Ok(contents) => contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return Ok(UserSkillStore { skills: Vec::new() })
+            return Ok(UserSkillStore {
+                skills: Vec::new(),
+                user_profile: None,
+            })
         }
         Err(err) => return Err(err.into()),
     };
@@ -83,7 +87,7 @@ pub async fn get_skills(job_text: String) -> Result<Vec<(f64, String, String)>> 
         return Ok(Vec::new());
     }
 
-    let openai_client = openai::Client::from_env();
+    let openai_client = openai_client_from_env()?;
     let embed_model = openai_client.embedding_model(EMBEDDING_MODEL_NAME);
 
     let updated = ensure_vectors(&mut store, &embed_model).await?;
@@ -127,6 +131,18 @@ pub fn list_story_documents() -> Result<Vec<String>> {
         .map(|story| story_document(&story.company, &story.year, &story.text))
         .collect();
     Ok(documents)
+}
+
+pub fn get_user_profile() -> Result<Option<UserProfile>> {
+    let store = load_kb()?;
+    Ok(store.user_profile)
+}
+
+pub fn set_user_profile(profile: UserProfile) -> Result<()> {
+    let mut store = load_kb()?;
+    store.user_profile = Some(profile);
+    save_kb(&store)?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,11 +1,54 @@
 use anyhow::{anyhow, Context, Result};
+use rig::providers::openai;
 use rig::completion::{AssistantContent, CompletionModel};
 use rig::OneOrMany;
 use schemars::{schema_for, JsonSchema};
 use serde::de::DeserializeOwned;
+use std::{env, time::Duration};
 
 pub const MODEL_NAME: &str = "gpt-5.2";
 pub const EMBEDDING_MODEL_NAME: &str = "text-embedding-ada-002";
+const DEFAULT_OPENAI_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_OPENAI_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+fn env_timeout_secs(var: &str, default: u64) -> Result<u64> {
+    match env::var(var) {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .with_context(|| format!("{var} must be an integer number of seconds")),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(err) => Err(anyhow!("failed to read {var}: {err}")),
+    }
+}
+
+pub fn openai_client_from_env() -> Result<openai::Client> {
+    let api_key = env::var("OPENAI_API_KEY")
+        .context("OPENAI_API_KEY not set (needed for OpenAI requests)")?;
+    if api_key.trim().is_empty() {
+        return Err(anyhow!("OPENAI_API_KEY is set but empty"));
+    }
+
+    let base_url = env::var("OPENAI_BASE_URL").ok();
+    let timeout_secs = env_timeout_secs("OPENAI_TIMEOUT_SECS", DEFAULT_OPENAI_TIMEOUT_SECS)?;
+    let connect_timeout_secs =
+        env_timeout_secs("OPENAI_CONNECT_TIMEOUT_SECS", DEFAULT_OPENAI_CONNECT_TIMEOUT_SECS)?;
+
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .connect_timeout(Duration::from_secs(connect_timeout_secs))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let mut builder = openai::Client::<reqwest::Client>::builder()
+        .api_key(api_key)
+        .http_client(http_client);
+    if let Some(base_url) = base_url {
+        builder = builder.base_url(base_url);
+    }
+
+    builder.build().context("failed to build OpenAI client")
+}
 
 fn text_from_choice(choice: OneOrMany<AssistantContent>) -> Result<String> {
     let parts = choice
