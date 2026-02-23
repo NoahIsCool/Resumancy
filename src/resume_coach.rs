@@ -54,10 +54,14 @@ fn missing_fields(parsed: &ParsedStory) -> Vec<String> {
 
 
 fn read_multiline() -> anyhow::Result<String> {
-    let mut input = String::new();
-    let mut line = String::new();
     let stdin = io::stdin();
     let mut handle = stdin.lock();
+    read_multiline_from(&mut handle)
+}
+
+fn read_multiline_from<R: BufRead>(handle: &mut R) -> anyhow::Result<String> {
+    let mut input = String::new();
+    let mut line = String::new();
 
     loop {
         line.clear();
@@ -216,4 +220,79 @@ pub async fn fill_skill_gaps(skill_assessment: SkillFocusList,
     }
     
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hiring_manager::SkillNeed;
+    use std::io::Cursor;
+
+    #[test]
+    fn missing_fields_detects_empty_values() {
+        let parsed = ParsedStory {
+            company: "".to_string(),
+            year: "  ".to_string(),
+            text: "\n".to_string(),
+        };
+        let fields = missing_fields(&parsed);
+        assert_eq!(fields, vec!["company", "year", "text"]);
+    }
+
+    #[test]
+    fn missing_fields_returns_empty_when_complete() {
+        let parsed = ParsedStory {
+            company: "Acme".to_string(),
+            year: "2022".to_string(),
+            text: "Did stuff".to_string(),
+        };
+        let fields = missing_fields(&parsed);
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn followup_fallback_question_without_missing() {
+        let question = followup_fallback_question(&[]);
+        assert_eq!(question, "Could you add a bit more detail to your story?");
+    }
+
+    #[test]
+    fn followup_fallback_question_with_missing() {
+        let missing = vec!["company".to_string(), "year".to_string()];
+        let question = followup_fallback_question(&missing);
+        assert_eq!(
+            question,
+            "Could you add details for missing fields: company, year?"
+        );
+    }
+
+    #[test]
+    fn adjacent_fallback_question_uses_title() {
+        let skill = SkillNeed {
+            title: "Rust".to_string(),
+            description: "Systems programming".to_string(),
+            need: 8,
+            suitability: 4,
+            skill_description: "Rust language".to_string(),
+            justification: "Some experience".to_string(),
+        };
+        let question = adjacent_fallback_question(&skill);
+        assert!(question.contains("Rust"));
+    }
+
+    #[test]
+    fn read_multiline_from_stops_on_blank_line() {
+        let input = "line1\nline2\n\nline3\n";
+        let mut reader = Cursor::new(input);
+        let output = read_multiline_from(&mut reader).expect("read");
+        assert_eq!(output, "line1\nline2");
+    }
+
+    #[test]
+    fn read_multiline_from_reads_until_eof() {
+        let input = "line1\r\nline2";
+        let mut reader = Cursor::new(input);
+        let output = read_multiline_from(&mut reader).expect("read");
+        assert_eq!(output, "line1\nline2");
+    }
 }

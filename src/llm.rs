@@ -122,3 +122,229 @@ where
 
     text_from_choice(response.choice)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rig::completion::{
+        AssistantContent, CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
+        Usage,
+    };
+    use rig::message::{Reasoning, Text};
+    use rig::streaming::StreamingCompletionResponse;
+    use rig::OneOrMany;
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+    use std::env;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        key: String,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &str, value: Option<&str>) -> Self {
+            let lock = ENV_LOCK.lock().expect("env lock");
+            let original = env::var(key).ok();
+            match value {
+                Some(value) => unsafe { env::set_var(key, value) },
+                None => unsafe { env::remove_var(key) },
+            }
+            Self {
+                _lock: lock,
+                key: key.to_string(),
+                original,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe { env::set_var(&self.key, value) },
+                None => unsafe { env::remove_var(&self.key) },
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockCompletionModel {
+        response: OneOrMany<AssistantContent>,
+    }
+
+    impl CompletionModel for MockCompletionModel {
+        type Response = ();
+        type StreamingResponse = ();
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self {
+                response: OneOrMany::one(AssistantContent::Text(Text {
+                    text: String::new(),
+                })),
+            }
+        }
+
+        fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> impl std::future::Future<
+            Output = Result<CompletionResponse<Self::Response>, CompletionError>,
+        > + Send {
+            let choice = self.response.clone();
+            async move {
+                Ok(CompletionResponse {
+                    choice,
+                    usage: Usage::default(),
+                    raw_response: (),
+                })
+            }
+        }
+
+        fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> impl std::future::Future<
+            Output = Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError>,
+        > + Send {
+            async { Err(CompletionError::ProviderError("streaming not supported".into())) }
+        }
+    }
+
+    #[test]
+    fn env_timeout_secs_defaults_when_missing() {
+        let _guard = EnvGuard::set("PIPELINES_TEST_TIMEOUT", None);
+        let value = env_timeout_secs("PIPELINES_TEST_TIMEOUT", 15).expect("timeout");
+        assert_eq!(value, 15);
+    }
+
+    #[test]
+    fn env_timeout_secs_parses_value() {
+        let _guard = EnvGuard::set("PIPELINES_TEST_TIMEOUT", Some("42"));
+        let value = env_timeout_secs("PIPELINES_TEST_TIMEOUT", 15).expect("timeout");
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn env_timeout_secs_rejects_invalid() {
+        let _guard = EnvGuard::set("PIPELINES_TEST_TIMEOUT", Some("nope"));
+        assert!(env_timeout_secs("PIPELINES_TEST_TIMEOUT", 15).is_err());
+    }
+
+    #[test]
+    fn openai_client_from_env_errors_when_missing_key() {
+        let _guard = EnvGuard::set("OPENAI_API_KEY", None);
+        let err = openai_client_from_env().unwrap_err().to_string();
+        assert!(err.contains("OPENAI_API_KEY not set"));
+    }
+
+    #[test]
+    fn openai_client_from_env_errors_when_empty_key() {
+        let _guard = EnvGuard::set("OPENAI_API_KEY", Some("   "));
+        let err = openai_client_from_env().unwrap_err().to_string();
+        assert!(err.contains("OPENAI_API_KEY is set but empty"));
+    }
+
+    #[test]
+    fn openai_client_from_env_ok_with_key() {
+        let _guard = EnvGuard::set("OPENAI_API_KEY", Some("test-key"));
+        let client = openai_client_from_env();
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn text_from_choice_joins_text_segments() {
+        let choice = OneOrMany::many(vec![
+            AssistantContent::Text(Text {
+                text: "first".to_string(),
+            }),
+            AssistantContent::Text(Text {
+                text: "second".to_string(),
+            }),
+        ])
+        .expect("non-empty");
+        let text = text_from_choice(choice).expect("text");
+        assert_eq!(text, "first\nsecond");
+    }
+
+    #[test]
+    fn text_from_choice_errors_without_text() {
+        let choice = OneOrMany::one(AssistantContent::Reasoning(Reasoning::new(
+            "reasoning",
+        )));
+        assert!(text_from_choice(choice).is_err());
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[allow(dead_code)]
+    struct DummySchema {
+        answer: String,
+    }
+
+    #[test]
+    fn structured_output_params_contains_schema_metadata() {
+        let params = structured_output_params::<DummySchema>("dummy").expect("params");
+        assert_eq!(params["text"]["format"]["type"], "json_schema");
+        assert_eq!(params["text"]["format"]["name"], "dummy");
+        assert_eq!(params["text"]["format"]["strict"], true);
+        assert!(params["text"]["format"]["schema"]["properties"]["answer"].is_object());
+    }
+
+    #[tokio::test]
+    async fn prompt_text_returns_text() {
+        let model = MockCompletionModel {
+            response: OneOrMany::one(AssistantContent::Text(Text {
+                text: "hello".to_string(),
+            })),
+        };
+        let text = prompt_text(&model, "preamble", "prompt")
+            .await
+            .expect("prompt");
+        assert_eq!(text, "hello");
+    }
+
+    #[tokio::test]
+    async fn prompt_structured_parses_json() {
+        #[derive(Debug, Deserialize, JsonSchema)]
+        struct Payload {
+            value: String,
+        }
+
+        let model = MockCompletionModel {
+            response: OneOrMany::one(AssistantContent::Text(Text {
+                text: r#"{"value":"ok"}"#.to_string(),
+            })),
+        };
+
+        let parsed: Payload =
+            prompt_structured(&model, "preamble", "prompt", "payload")
+                .await
+                .expect("structured");
+        assert_eq!(parsed.value, "ok");
+    }
+
+    #[tokio::test]
+    async fn prompt_structured_errors_on_invalid_json() {
+        #[derive(Debug, Deserialize, JsonSchema)]
+        #[allow(dead_code)]
+        struct Payload {
+            value: String,
+        }
+
+        let model = MockCompletionModel {
+            response: OneOrMany::one(AssistantContent::Text(Text {
+                text: "not-json".to_string(),
+            })),
+        };
+
+        let err = prompt_structured::<_, Payload>(&model, "preamble", "prompt", "payload")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to parse structured output"));
+    }
+}

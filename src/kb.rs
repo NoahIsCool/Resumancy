@@ -1,6 +1,6 @@
 use std::{fs, io};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -90,6 +90,10 @@ pub fn story_id(company: &str, year: &str, text: &str) -> String {
     format!("story_{}", hex::encode(hasher.finalize()))
 }
 
+fn default_kb_path() -> PathBuf {
+    Path::new(DEFAULT_KB_PATH).to_path_buf()
+}
+
 fn read_required_line(prompt: &str) -> anyhow::Result<String> {
     loop {
         print!("{prompt}");
@@ -126,7 +130,15 @@ pub async fn add_story_to_store(
     story: StorySeed,
     embed_model: &impl rig::embeddings::EmbeddingModel,
 ) -> anyhow::Result<()> {
-    let mut store = load_kb()?;
+    add_story_to_store_at(&default_kb_path(), story, embed_model).await
+}
+
+pub async fn add_story_to_store_at(
+    path: &Path,
+    story: StorySeed,
+    embed_model: &impl rig::embeddings::EmbeddingModel,
+) -> anyhow::Result<()> {
+    let mut store = load_kb_at(path)?;
     let document = story_document(&story.company, &story.year, &story.text);
     let embedding = embed_model.embed_text(&document).await?;
 
@@ -137,12 +149,16 @@ pub async fn add_story_to_store(
         vector: embedding.vec,
     });
 
-    save_kb(&store)?;
+    save_kb_at(path, &store)?;
     Ok(())
 }
 
 pub fn load_kb() -> anyhow::Result<UserSkillStore> {
-    let contents = match fs::read_to_string(DEFAULT_KB_PATH) {
+    load_kb_at(&default_kb_path())
+}
+
+pub fn load_kb_at(path: &Path) -> anyhow::Result<UserSkillStore> {
+    let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             return Ok(UserSkillStore {
@@ -157,20 +173,27 @@ pub fn load_kb() -> anyhow::Result<UserSkillStore> {
 }
 
 pub fn save_kb(store: &UserSkillStore) -> anyhow::Result<()> {
+    save_kb_at(&default_kb_path(), store)
+}
+
+pub fn save_kb_at(path: &Path, store: &UserSkillStore) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(store)?;
-    let out_path = Path::new(DEFAULT_KB_PATH);
-    if let Some(parent) = out_path.parent() {
+    if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create kb dir: {}", parent.display()))?;
         }
     }
-    fs::write(out_path, json)?;
+    fs::write(path, json)?;
     Ok(())
 }
 
 pub fn list_story_documents() -> anyhow::Result<Vec<String>> {
-    let store = load_kb()?;
+    list_story_documents_at(&default_kb_path())
+}
+
+pub fn list_story_documents_at(path: &Path) -> anyhow::Result<Vec<String>> {
+    let store = load_kb_at(path)?;
     let documents = store
         .skills
         .iter()
@@ -192,7 +215,11 @@ pub fn get_or_build_user_profile() -> anyhow::Result<UserProfile> {
 }
 
 pub fn get_user_profile() -> anyhow::Result<Option<UserProfile>> {
-    let store = load_kb()?;
+    get_user_profile_at(&default_kb_path())
+}
+
+pub fn get_user_profile_at(path: &Path) -> anyhow::Result<Option<UserProfile>> {
+    let store = load_kb_at(path)?;
     Ok(store.user_profile)
 }
 
@@ -254,8 +281,226 @@ fn collect_user_profile() -> anyhow::Result<UserProfile> {
 }
 
 pub fn set_user_profile(profile: UserProfile) -> anyhow::Result<()> {
-    let mut store = load_kb()?;
+    set_user_profile_at(&default_kb_path(), profile)
+}
+
+pub fn set_user_profile_at(path: &Path, profile: UserProfile) -> anyhow::Result<()> {
+    let mut store = load_kb_at(path)?;
     store.user_profile = Some(profile);
-    save_kb(&store)?;
+    save_kb_at(path, &store)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
+    use std::future;
+
+    #[derive(Clone)]
+    struct DummyEmbeddingModel {
+        vector: Vec<f64>,
+    }
+
+    impl EmbeddingModel for DummyEmbeddingModel {
+        const MAX_DOCUMENTS: usize = 16;
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
+            Self {
+                vector: vec![0.1, 0.2, 0.3],
+            }
+        }
+
+        fn ndims(&self) -> usize {
+            self.vector.len()
+        }
+
+        fn embed_texts(
+            &self,
+            texts: impl IntoIterator<Item = String> + Send,
+        ) -> impl future::Future<Output = Result<Vec<Embedding>, EmbeddingError>> + Send {
+            let vec = self.vector.clone();
+            let embeddings = texts
+                .into_iter()
+                .map(|text| Embedding {
+                    document: text,
+                    vec: vec.clone(),
+                })
+                .collect::<Vec<_>>();
+            async move { Ok(embeddings) }
+        }
+    }
+
+    #[test]
+    fn story_document_formats() {
+        let doc = story_document("Acme", "2022", "Shipped a thing");
+        assert_eq!(doc, "Acme (2022): Shipped a thing");
+    }
+
+    #[test]
+    fn story_id_is_deterministic_and_unique() {
+        let id1 = story_id("Acme", "2022", "Did stuff");
+        let id2 = story_id("Acme", "2022", "Did stuff");
+        let id3 = story_id("Acme", "2023", "Did stuff");
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+        assert!(id1.starts_with("story_"));
+        assert_eq!(id1.len(), "story_".len() + 64);
+    }
+
+    #[test]
+    fn load_kb_missing_file_returns_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing.json");
+        let store = load_kb_at(&path).expect("load");
+        assert!(store.skills.is_empty());
+        assert!(store.user_profile.is_none());
+    }
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kb.json");
+        let store = UserSkillStore {
+            skills: vec![Story {
+                company: "Acme".to_string(),
+                year: "2022".to_string(),
+                text: "Did stuff".to_string(),
+                vector: vec![1.0, 2.0],
+            }],
+            user_profile: Some(UserProfile {
+                name: "Ada".to_string(),
+                location: "NYC".to_string(),
+                email: "ada@example.com".to_string(),
+                phone: "555-1234".to_string(),
+                links: vec![ProfileLink {
+                    label: "GitHub".to_string(),
+                    url: "https://github.com/ada".to_string(),
+                }],
+                education: vec![EducationEntry {
+                    degree: "BS CS".to_string(),
+                    graduation_date: "2020".to_string(),
+                }],
+                jobs: vec![JobEntry {
+                    company: "Acme".to_string(),
+                    title: "Engineer".to_string(),
+                    location: "Remote".to_string(),
+                    start_date: "2020".to_string(),
+                    end_date: "2022".to_string(),
+                }],
+            }),
+        };
+
+        save_kb_at(&path, &store).expect("save");
+        let loaded = load_kb_at(&path).expect("load");
+        assert_eq!(
+            serde_json::to_value(store).unwrap(),
+            serde_json::to_value(loaded).unwrap()
+        );
+    }
+
+    #[test]
+    fn save_kb_creates_parent_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("kb.json");
+        let store = UserSkillStore {
+            skills: Vec::new(),
+            user_profile: None,
+        };
+        save_kb_at(&path, &store).expect("save");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn list_story_documents_returns_expected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kb.json");
+        let store = UserSkillStore {
+            skills: vec![
+                Story {
+                    company: "Acme".to_string(),
+                    year: "2022".to_string(),
+                    text: "Did stuff".to_string(),
+                    vector: vec![],
+                },
+                Story {
+                    company: "Beta".to_string(),
+                    year: "2021".to_string(),
+                    text: "Built thing".to_string(),
+                    vector: vec![],
+                },
+            ],
+            user_profile: None,
+        };
+        save_kb_at(&path, &store).expect("save");
+        let docs = list_story_documents_at(&path).expect("list");
+        assert_eq!(
+            docs,
+            vec![
+                "Acme (2022): Did stuff".to_string(),
+                "Beta (2021): Built thing".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn set_and_get_user_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kb.json");
+        save_kb_at(
+            &path,
+            &UserSkillStore {
+                skills: Vec::new(),
+                user_profile: None,
+            },
+        )
+        .expect("save");
+
+        let profile = UserProfile {
+            name: "Ada".to_string(),
+            location: "NYC".to_string(),
+            email: "ada@example.com".to_string(),
+            phone: "555-1234".to_string(),
+            links: Vec::new(),
+            education: Vec::new(),
+            jobs: Vec::new(),
+        };
+        set_user_profile_at(&path, profile.clone()).expect("set");
+        let loaded = get_user_profile_at(&path).expect("get");
+        assert_eq!(
+            serde_json::to_value(profile).unwrap(),
+            serde_json::to_value(loaded.unwrap()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_story_to_store_adds_embedding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kb.json");
+        save_kb_at(
+            &path,
+            &UserSkillStore {
+                skills: Vec::new(),
+                user_profile: None,
+            },
+        )
+        .expect("save");
+
+        let model = DummyEmbeddingModel {
+            vector: vec![0.5, 0.6],
+        };
+        let story = StorySeed {
+            company: "Acme".to_string(),
+            year: "2022".to_string(),
+            text: "Did stuff".to_string(),
+        };
+
+        add_story_to_store_at(&path, story, &model)
+            .await
+            .expect("add");
+        let loaded = load_kb_at(&path).expect("load");
+        assert_eq!(loaded.skills.len(), 1);
+        assert_eq!(loaded.skills[0].vector, vec![0.5, 0.6]);
+    }
 }

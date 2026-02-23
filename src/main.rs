@@ -39,7 +39,6 @@ async fn main() -> anyhow::Result<()> {
     let skill_assessment = hiring_manager::evaluate_candidate(job_text, &completion_model).await?;
     eprintln!("Done.");
 
-    // TODO: make this a proper error...
     if skill_assessment.skills.is_empty() {
         println!("No skill gaps detected from the posting and existing evidence.");
         return Ok(());

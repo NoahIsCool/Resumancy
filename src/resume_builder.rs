@@ -104,13 +104,13 @@ async fn fix_and_save_latex(
     completion_model: &ResponsesCompletionModel,
 ) -> anyhow::Result<()>{
 
-    let output_tex = out_dir.join("generated_resume.tex");
+    let output_tex = out_dir.join("resume.tex");
 
     for attempt in 0..=MAX_LATEX_FIXES {
         fs::write(&output_tex, resume_latex.as_str())
             .with_context(|| format!("failed to write resume to {}", output_tex.to_str().unwrap()))?;
 
-        let compile = compile_latex(output_tex.clone())?;
+        let compile = compile_latex(out_dir.join("resume.pdf"))?;
         if compile.success && !compile.has_warning && !compile.has_error {
             println!("Wrote PDF resume to generated_resume.pdf");
             break;
@@ -207,4 +207,85 @@ pub async fn build_resume(job_text: &String,
     fix_and_save_latex(out_dir, &mut resume_latex, completion_model).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kb::{EducationEntry, JobEntry, ProfileLink, UserProfile};
+
+    #[test]
+    fn tail_lines_returns_input_when_under_limit() {
+        let input = "line1\nline2\nline3";
+        let output = tail_lines(input, 5);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn tail_lines_returns_last_lines() {
+        let input = "line1\nline2\nline3\nline4";
+        let output = tail_lines(input, 2);
+        assert_eq!(output, "line3\nline4");
+    }
+
+    #[test]
+    fn format_user_profile_with_empty_sections() {
+        let profile = UserProfile {
+            name: "Ada".to_string(),
+            location: "NYC".to_string(),
+            email: "ada@example.com".to_string(),
+            phone: "555-1234".to_string(),
+            links: Vec::new(),
+            education: Vec::new(),
+            jobs: Vec::new(),
+        };
+        let formatted = format_user_profile(&profile);
+        let expected = "\
+Name: Ada
+Location: NYC
+Email: ada@example.com
+Phone: 555-1234
+Links: None.
+Education: None.
+Job History: None.";
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn format_user_profile_with_entries() {
+        let profile = UserProfile {
+            name: "Ada".to_string(),
+            location: "NYC".to_string(),
+            email: "ada@example.com".to_string(),
+            phone: "555-1234".to_string(),
+            links: vec![ProfileLink {
+                label: "GitHub".to_string(),
+                url: "https://github.com/ada".to_string(),
+            }],
+            education: vec![EducationEntry {
+                degree: "BS CS".to_string(),
+                graduation_date: "2020".to_string(),
+            }],
+            jobs: vec![JobEntry {
+                company: "Acme".to_string(),
+                title: "Engineer".to_string(),
+                location: "Remote".to_string(),
+                start_date: "2020".to_string(),
+                end_date: "2022".to_string(),
+            }],
+        };
+        let formatted = format_user_profile(&profile);
+        let expected = "\
+Name: Ada
+Location: NYC
+Email: ada@example.com
+Phone: 555-1234
+Links:
+- GitHub: https://github.com/ada
+Education:
+- BS CS (Graduation: 2020)
+Job History:
+- Acme — Engineer, Remote (2020 to 2022)";
+        assert_eq!(formatted, expected);
+    }
 }
