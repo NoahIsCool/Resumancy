@@ -80,6 +80,56 @@ pub fn story_document(company: &str, year: &str, text: &str) -> String {
     format!("{company} ({year}): {text}")
 }
 
+fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let mag_a: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let mag_b: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if mag_a == 0.0 || mag_b == 0.0 {
+        return 0.0;
+    }
+    dot / (mag_a * mag_b)
+}
+
+pub async fn retrieve_relevant_stories(
+    query: &str,
+    top_n: usize,
+    embed_model: &impl rig::embeddings::EmbeddingModel,
+) -> anyhow::Result<Vec<Story>> {
+    retrieve_relevant_stories_at(&default_kb_path(), query, top_n, embed_model).await
+}
+
+pub async fn retrieve_relevant_stories_at(
+    path: &Path,
+    query: &str,
+    top_n: usize,
+    embed_model: &impl rig::embeddings::EmbeddingModel,
+) -> anyhow::Result<Vec<Story>> {
+    let store = load_kb_at(path)?;
+    if store.skills.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let query_embedding = embed_model.embed_text(query).await?;
+    let query_vec = &query_embedding.vec;
+
+    let mut scored: Vec<(f64, &Story)> = store
+        .skills
+        .iter()
+        .map(|story| {
+            let score = cosine_similarity(query_vec, &story.vector);
+            (score, story)
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(top_n);
+
+    Ok(scored.into_iter().map(|(_, story)| story.clone()).collect())
+}
+
 pub fn story_id(company: &str, year: &str, text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(company.as_bytes());
@@ -502,5 +552,91 @@ mod tests {
         let loaded = load_kb_at(&path).expect("load");
         assert_eq!(loaded.skills.len(), 1);
         assert_eq!(loaded.skills[0].vector, vec![0.5, 0.6]);
+    }
+
+    #[test]
+    fn cosine_similarity_identical_vectors() {
+        let a = vec![1.0, 2.0, 3.0];
+        let score = cosine_similarity(&a, &a);
+        assert!((score - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn cosine_similarity_orthogonal_vectors() {
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        let score = cosine_similarity(&a, &b);
+        assert!(score.abs() < 1e-10);
+    }
+
+    #[test]
+    fn cosine_similarity_empty_returns_zero() {
+        let score = cosine_similarity(&[], &[]);
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn cosine_similarity_mismatched_lengths_returns_zero() {
+        let a = vec![1.0, 2.0];
+        let b = vec![1.0];
+        let score = cosine_similarity(&a, &b);
+        assert_eq!(score, 0.0);
+    }
+
+    #[tokio::test]
+    async fn retrieve_relevant_stories_orders_by_similarity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kb.json");
+        let store = UserSkillStore {
+            skills: vec![
+                Story {
+                    company: "Far".to_string(),
+                    year: "2020".to_string(),
+                    text: "Unrelated".to_string(),
+                    vector: vec![0.0, 0.0, 1.0],
+                },
+                Story {
+                    company: "Close".to_string(),
+                    year: "2021".to_string(),
+                    text: "Relevant".to_string(),
+                    vector: vec![1.0, 0.0, 0.0],
+                },
+            ],
+            user_profile: None,
+        };
+        save_kb_at(&path, &store).expect("save");
+
+        // Dummy model returns [1.0, 0.0, 0.0] — should match "Close" best
+        let model = DummyEmbeddingModel {
+            vector: vec![1.0, 0.0, 0.0],
+        };
+        let results = retrieve_relevant_stories_at(&path, "query", 2, &model)
+            .await
+            .expect("retrieve");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].company, "Close");
+        assert_eq!(results[1].company, "Far");
+    }
+
+    #[tokio::test]
+    async fn retrieve_relevant_stories_respects_top_n() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kb.json");
+        let store = UserSkillStore {
+            skills: vec![
+                Story { company: "A".into(), year: "2020".into(), text: "a".into(), vector: vec![1.0, 0.0] },
+                Story { company: "B".into(), year: "2021".into(), text: "b".into(), vector: vec![0.9, 0.1] },
+                Story { company: "C".into(), year: "2022".into(), text: "c".into(), vector: vec![0.0, 1.0] },
+            ],
+            user_profile: None,
+        };
+        save_kb_at(&path, &store).expect("save");
+
+        let model = DummyEmbeddingModel { vector: vec![1.0, 0.0] };
+        let results = retrieve_relevant_stories_at(&path, "q", 1, &model)
+            .await
+            .expect("retrieve");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].company, "A");
     }
 }

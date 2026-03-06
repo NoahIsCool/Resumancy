@@ -1,8 +1,8 @@
 use anyhow::Context;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use rig::providers::openai::responses_api::ResponsesCompletionModel;
-use crate::llm::prompt_structured;
+use rig::completion::CompletionModel;
+use crate::llm::{prompt_structured, Provider};
 use crate::prompts;
 use crate::kb::load_kb;
 
@@ -17,6 +17,7 @@ pub struct JobNeeds {
 pub struct Need {
     pub title: String, // title of the skill
     pub description: String, // short description of the skill area.
+    pub skill_description: String, // short phrase describing the skill area.
     pub need: u8, //ranking from 0-9 of how necessary the skill is
 }
 
@@ -38,22 +39,22 @@ pub struct SkillNeed {
     pub justification: String, // a short justification of the candidate's ranking in this skill area.
 }
 
-pub async fn get_job_needs(job_text: &String, completion_model: &ResponsesCompletionModel) -> Result<JobNeeds, anyhow::Error> {
-    // Identify skill gaps with structured outputs
+pub async fn get_job_needs<M: CompletionModel + Clone>(job_text: &String, completion_model: &M, provider: Provider) -> Result<JobNeeds, anyhow::Error> {
     let job_prompt = format!("JOB POSTING:\n{}\n", job_text);
-    
+
     let job_needs: JobNeeds = prompt_structured(
         completion_model,
         prompts::JOB_POST_PREAMBLE,
         &job_prompt,
         "job_needs_list",
+        provider,
     ).await?;
-    
+
     Ok(job_needs)
 }
 
-pub async fn evaluate_candidate(job_text: &String, completion_model: &ResponsesCompletionModel) -> Result<SkillFocusList, anyhow::Error> {
-    let job_needs = get_job_needs(job_text, completion_model).await?;
+pub async fn evaluate_candidate<M: CompletionModel + Clone>(job_text: &String, completion_model: &M, provider: Provider) -> Result<SkillFocusList, anyhow::Error> {
+    let job_needs = get_job_needs(job_text, completion_model, provider).await?;
 
     let job_needs_str =
         serde_json::to_string_pretty(&job_needs).context("failed to serialize job needs")?;
@@ -82,6 +83,7 @@ pub async fn evaluate_candidate(job_text: &String, completion_model: &ResponsesC
         prompts::EVALUATION_PREAMBLE,
         &skill_plan_prompt,
         "skill_focus_list",
+        provider,
     ).await?;
     
     Ok(skill_plan)

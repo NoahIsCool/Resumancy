@@ -2,13 +2,12 @@ use std::io;
 use std::io::{BufRead, Write};
 use anyhow::anyhow;
 use rig::completion::CompletionModel;
-use rig::providers::openai::responses_api::ResponsesCompletionModel;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use crate::{kb, prompts};
 use crate::hiring_manager::{SkillFocusList, SkillNeed};
 use crate::kb::StorySeed;
-use crate::llm::prompt_structured;
+use crate::llm::{prompt_structured, Provider};
 
 const MAX_SKILL_TURNS: usize = 4;
 
@@ -99,7 +98,7 @@ fn adjacent_fallback_question(skill: &SkillNeed) -> String {
     )
 }
 
-async fn collect_story_for_skill<M>(model: &M, skill: &SkillNeed) -> anyhow::Result<Option<ParsedStory>>
+async fn collect_story_for_skill<M>(model: &M, skill: &SkillNeed, provider: Provider) -> anyhow::Result<Option<ParsedStory>>
 where
     M: CompletionModel + Clone,
 {
@@ -128,6 +127,7 @@ Finish with an empty line."
             prompts::STORY_ASSESS_PREAMBLE,
             &assessment_prompt,
             "story_assessment",
+            provider,
         ).await?;
 
         let computed_missing = missing_fields(&assessment.parsed_story);
@@ -191,20 +191,35 @@ Finish with an empty line."
     ))
 }
 
-pub async fn fill_skill_gaps(skill_assessment: SkillFocusList, 
-                             completion_model: &ResponsesCompletionModel,
-                             embed_model: &impl rig::embeddings::EmbeddingModel
+pub async fn fill_skill_gaps<M: CompletionModel + Clone>(
+    skill_assessment: &SkillFocusList,
+    gap_threshold: i16,
+    completion_model: &M,
+    embed_model: &impl rig::embeddings::EmbeddingModel,
+    provider: Provider,
 ) -> Result<(), anyhow::Error> {
+    let gaps: Vec<_> = skill_assessment.skills.iter()
+        .filter(|s| (s.need as i16 - s.suitability as i16) >= gap_threshold)
+        .collect();
 
-    for (idx, skill) in skill_assessment.skills.iter().enumerate() {
+    if gaps.is_empty() {
+        println!("No significant skill gaps to address (threshold: {}).", gap_threshold);
+        return Ok(());
+    }
+
+    println!("\nCoaching on {} skill gap(s) (need - suitability >= {}):", gaps.len(), gap_threshold);
+
+    for (idx, skill) in gaps.iter().enumerate() {
         println!(
-            "\n=== Skill {}/{}: {} ===",
+            "\n=== Skill {}/{}: {} (need: {}, suitability: {}) ===",
             idx + 1,
-            skill_assessment.skills.len(),
-            skill.title
+            gaps.len(),
+            skill.title,
+            skill.need,
+            skill.suitability,
         );
 
-        let parsed = collect_story_for_skill(completion_model, skill).await?;
+        let parsed = collect_story_for_skill(completion_model, skill, provider).await?;
         let Some(parsed) = parsed else {
             println!("Skipped");
             continue;
@@ -218,7 +233,7 @@ pub async fn fill_skill_gaps(skill_assessment: SkillFocusList,
         kb::add_story_to_store(story, embed_model).await?;
         println!("Saved");
     }
-    
+
     Ok(())
 }
 
