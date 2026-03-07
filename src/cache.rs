@@ -43,16 +43,25 @@ fn default_cache_dir() -> PathBuf {
     Path::new(DEFAULT_CACHE_DIR).to_path_buf()
 }
 
-pub fn get_cached(key: &str) -> Result<Option<String>> {
-    get_cached_at(&default_cache_dir(), key)
+pub fn get_cached(key: &str, max_age: Option<std::time::Duration>) -> Result<Option<String>> {
+    get_cached_at(&default_cache_dir(), key, max_age)
 }
 
-pub fn get_cached_at(cache_dir: &Path, key: &str) -> Result<Option<String>> {
+pub fn get_cached_at(cache_dir: &Path, key: &str, max_age: Option<std::time::Duration>) -> Result<Option<String>> {
     let path = cache_dir.join(format!("{}.json", key));
     match fs::read_to_string(&path) {
         Ok(contents) => {
             let entry: CacheEntry = serde_json::from_str(&contents)
                 .with_context(|| format!("failed to parse cache entry: {}", path.display()))?;
+            if let Some(max_age) = max_age {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if now.saturating_sub(entry.created_at) >= max_age.as_secs() {
+                    return Ok(None);
+                }
+            }
             Ok(Some(entry.text))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -116,7 +125,7 @@ mod tests {
     #[test]
     fn cache_miss_returns_none() {
         let dir = tempfile::tempdir().unwrap();
-        let result = get_cached_at(dir.path(), "nonexistent").unwrap();
+        let result = get_cached_at(dir.path(), "nonexistent", None).unwrap();
         assert!(result.is_none());
     }
 
@@ -124,7 +133,7 @@ mod tests {
     fn cache_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         set_cached_at(dir.path(), "test_key", "hello world").unwrap();
-        let result = get_cached_at(dir.path(), "test_key").unwrap();
+        let result = get_cached_at(dir.path(), "test_key", None).unwrap();
         assert_eq!(result, Some("hello world".to_string()));
     }
 
@@ -133,7 +142,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         set_cached_at(dir.path(), "key", "first").unwrap();
         set_cached_at(dir.path(), "key", "second").unwrap();
-        let result = get_cached_at(dir.path(), "key").unwrap();
+        let result = get_cached_at(dir.path(), "key", None).unwrap();
         assert_eq!(result, Some("second".to_string()));
     }
 
@@ -142,7 +151,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("nested").join("cache");
         set_cached_at(&nested, "key", "value").unwrap();
-        let result = get_cached_at(&nested, "key").unwrap();
+        let result = get_cached_at(&nested, "key", None).unwrap();
         assert_eq!(result, Some("value".to_string()));
+    }
+
+    #[test]
+    fn cache_ttl_returns_fresh_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        set_cached_at(dir.path(), "fresh", "data").unwrap();
+        let result = get_cached_at(dir.path(), "fresh", Some(std::time::Duration::from_secs(3600))).unwrap();
+        assert_eq!(result, Some("data".to_string()));
+    }
+
+    #[test]
+    fn cache_ttl_zero_expires_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        set_cached_at(dir.path(), "old", "stale").unwrap();
+        let result = get_cached_at(dir.path(), "old", Some(std::time::Duration::from_secs(0))).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn cache_no_ttl_never_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        set_cached_at(dir.path(), "forever", "data").unwrap();
+        let result = get_cached_at(dir.path(), "forever", None).unwrap();
+        assert_eq!(result, Some("data".to_string()));
     }
 }

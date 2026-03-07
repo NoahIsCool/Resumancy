@@ -2,9 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context};
 use rig::completion::CompletionModel;
-use rig::client::{CompletionClient, EmbeddingsClient};
-use pipelines::llm::{self, Provider, NullEmbeddingModel, CacheConfig};
-use pipelines::stats::{StatsCollector, LlmCall};
+use pipelines::batch;
+use pipelines::llm::{Provider, CacheConfig};
+use pipelines::stats::StatsCollector;
 use pipelines::ui::Ui;
 use pipelines::{hiring_manager, kb, resume_builder, resume_coach};
 use clap::Parser;
@@ -52,9 +52,18 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     gap_threshold: i16,
 
+    /// Number of related stories from the knowledge base to show when
+    /// prompting for a new skill story (helps decide whether to skip)
+    #[arg(long, default_value_t = 1)]
+    related_skills: usize,
+
     /// Disable response caching
     #[arg(long, default_value_t = false)]
     no_cache: bool,
+
+    /// Cache TTL in seconds (entries older than this are treated as misses)
+    #[arg(long)]
+    cache_ttl: Option<u64>,
 
     /// Stream LLM output for resume generation
     #[arg(long, default_value_t = false)]
@@ -108,29 +117,6 @@ fn init_tracing(trace: bool) -> Option<opentelemetry_sdk::trace::SdkTracerProvid
     }
 }
 
-/// Recursively collect all `.md` files under `dir`.
-fn find_md_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let mut results = Vec::new();
-    find_md_files_recursive(dir, &mut results)?;
-    results.sort();
-    Ok(results)
-}
-
-fn find_md_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
-    for entry in fs::read_dir(dir)
-        .with_context(|| format!("failed to read directory: {}", dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            find_md_files_recursive(&path, out)?;
-        } else if path.extension().is_some_and(|ext| ext == "md") {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
 /// Run the full pipeline for a single job posting.
 async fn run_pipeline<M, E>(
     job_text: &String,
@@ -143,6 +129,7 @@ async fn run_pipeline<M, E>(
     run_eval: bool,
     stream: bool,
     gap_threshold: i16,
+    related_skills: usize,
     ui: &Ui,
     stats: &StatsCollector,
     cache: &CacheConfig,
@@ -157,14 +144,8 @@ where
 
     let spinner = ui.spinner(&format!("Requesting job needs from {}...", model_name));
     let timer = stats.start_timer();
-    let skill_assessment = hiring_manager::evaluate_candidate(job_text, completion_model, provider, cache_opt).await?;
-    stats.record(LlmCall {
-        label: "evaluate_candidate".into(),
-        model: model_name.into(),
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        duration: timer.elapsed(),
-    });
+    let (skill_assessment, eval_usage) = hiring_manager::evaluate_candidate(job_text, completion_model, provider, cache_opt).await?;
+    stats.record_with_usage("evaluate_candidate", model_name, eval_usage, timer.elapsed());
     spinner.finish("Job analysis complete");
 
     if skill_assessment.skills.is_empty() {
@@ -183,14 +164,8 @@ where
 
         ui.header("Coaching on skill gaps");
         let timer = stats.start_timer();
-        resume_coach::fill_skill_gaps(&skill_assessment, gap_threshold, completion_model, embed_model, provider).await?;
-        stats.record(LlmCall {
-            label: "skill_coaching".into(),
-            model: model_name.into(),
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            duration: timer.elapsed(),
-        });
+        resume_coach::fill_skill_gaps(&skill_assessment, gap_threshold, related_skills, completion_model, embed_model, provider).await?;
+        stats.record_with_usage("skill_coaching", model_name, rig::completion::Usage::default(), timer.elapsed());
     }
 
     let user_profile = kb::get_or_build_user_profile()?;
@@ -204,7 +179,7 @@ where
     };
 
     let timer = stats.start_timer();
-    let evaluation = resume_builder::build_resume(
+    let (evaluation, resume_usage) = resume_builder::build_resume(
         job_text,
         user_profile.clone(),
         &skill_assessment,
@@ -217,13 +192,7 @@ where
         stream,
         cache_opt,
     ).await?;
-    stats.record(LlmCall {
-        label: "build_resume".into(),
-        model: model_name.into(),
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        duration: timer.elapsed(),
-    });
+    stats.record_with_usage("build_resume", model_name, resume_usage, timer.elapsed());
 
     if let Some(s) = spinner {
         s.finish("Resume generated");
@@ -257,7 +226,7 @@ where
         };
 
         let timer = stats.start_timer();
-        resume_builder::build_cover_letter(
+        let cl_usage = resume_builder::build_cover_letter(
             job_text,
             &user_profile,
             &skill_assessment,
@@ -268,13 +237,7 @@ where
             stream,
             cache_opt,
         ).await?;
-        stats.record(LlmCall {
-            label: "cover_letter".into(),
-            model: model_name.into(),
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            duration: timer.elapsed(),
-        });
+        stats.record_with_usage("cover_letter", model_name, cl_usage, timer.elapsed());
 
         if let Some(s) = cl_spinner {
             s.finish("Cover letter generated");
@@ -297,63 +260,9 @@ async fn dispatch_pipeline(
     stats: &StatsCollector,
     cache: &CacheConfig,
 ) -> anyhow::Result<()> {
-    match args.provider {
-        Provider::Claude => {
-            let client = llm::anthropic_client_from_env()?;
-            let m = client.completion_model(model_name);
-            let e = NullEmbeddingModel;
-            run_pipeline(job_text, out_dir, model_name, &m, &e, args.provider, args.cover_letter, args.eval, args.stream, gap_threshold, ui, stats, cache).await
-        }
-        Provider::OpenAI => {
-            let client = llm::openai_client_from_env()?;
-            let m = client.completion_model(model_name);
-            let embed_name = args.embedding_model.clone()
-                .or_else(|| Provider::OpenAI.default_embedding_model().map(String::from))
-                .unwrap();
-            let e = client.embedding_model(&embed_name);
-            run_pipeline(job_text, out_dir, model_name, &m, &e, args.provider, args.cover_letter, args.eval, args.stream, gap_threshold, ui, stats, cache).await
-        }
-        Provider::Gemini => {
-            let client = llm::gemini_client_from_env()?;
-            let m = client.completion_model(model_name);
-            let embed_name = args.embedding_model.clone()
-                .or_else(|| Provider::Gemini.default_embedding_model().map(String::from))
-                .unwrap();
-            let e = client.embedding_model(&embed_name);
-            run_pipeline(job_text, out_dir, model_name, &m, &e, args.provider, args.cover_letter, args.eval, args.stream, gap_threshold, ui, stats, cache).await
-        }
-        Provider::Ollama => {
-            let client = llm::ollama_client_from_env()?;
-            let m = client.completion_model(model_name);
-            if let Some(embed_name) = args.embedding_model.clone()
-                .or_else(|| Provider::Ollama.default_embedding_model().map(String::from))
-            {
-                let e = client.embedding_model(&embed_name);
-                run_pipeline(job_text, out_dir, model_name, &m, &e, args.provider, args.cover_letter, args.eval, args.stream, gap_threshold, ui, stats, cache).await
-            } else {
-                let e = NullEmbeddingModel;
-                run_pipeline(job_text, out_dir, model_name, &m, &e, args.provider, args.cover_letter, args.eval, args.stream, gap_threshold, ui, stats, cache).await
-            }
-        }
-        Provider::DeepSeek => {
-            let client = llm::deepseek_client_from_env()?;
-            let m = client.completion_model(model_name);
-            let e = NullEmbeddingModel;
-            run_pipeline(job_text, out_dir, model_name, &m, &e, args.provider, args.cover_letter, args.eval, args.stream, gap_threshold, ui, stats, cache).await
-        }
-        Provider::Groq => {
-            let client = llm::groq_client_from_env()?;
-            let m = client.completion_model(model_name);
-            let e = NullEmbeddingModel;
-            run_pipeline(job_text, out_dir, model_name, &m, &e, args.provider, args.cover_letter, args.eval, args.stream, gap_threshold, ui, stats, cache).await
-        }
-        Provider::XAI => {
-            let client = llm::xai_client_from_env()?;
-            let m = client.completion_model(model_name);
-            let e = NullEmbeddingModel;
-            run_pipeline(job_text, out_dir, model_name, &m, &e, args.provider, args.cover_letter, args.eval, args.stream, gap_threshold, ui, stats, cache).await
-        }
-    }
+    pipelines::dispatch_provider!(args.provider, model_name, args.embedding_model.clone(), |m, e| {
+        run_pipeline(job_text, out_dir, model_name, &m, &e, args.provider, args.cover_letter, args.eval, args.stream, gap_threshold, args.related_skills, ui, stats, cache).await
+    })
 }
 
 #[tokio::main]
@@ -372,6 +281,7 @@ async fn main() -> anyhow::Result<()> {
         provider_name: args.provider.name().to_string(),
         model_name: model_name.clone(),
         enabled: !args.no_cache,
+        max_age: args.cache_ttl.map(std::time::Duration::from_secs),
     };
 
     ui.detail("Provider", &format!("{:?}", args.provider));
@@ -382,7 +292,7 @@ async fn main() -> anyhow::Result<()> {
 
     let result = if args.job_path.is_dir() {
         // ── Batch mode ──────────────────────────────────────────────
-        let md_files = find_md_files(&args.job_path)?;
+        let md_files = batch::find_md_files(&args.job_path)?;
         if md_files.is_empty() {
             return Err(anyhow!("no .md files found in {}", args.job_path.display()));
         }

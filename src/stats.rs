@@ -43,8 +43,8 @@ impl StatsCollector {
 
     pub fn record_with_usage(&self, label: &str, model: &str, usage: rig::completion::Usage, duration: Duration) {
         self.record(LlmCall {
-            label: label.to_string(),
-            model: model.to_string(),
+            label: label.into(),
+            model: model.into(),
             prompt_tokens: usage.input_tokens,
             completion_tokens: usage.output_tokens,
             duration,

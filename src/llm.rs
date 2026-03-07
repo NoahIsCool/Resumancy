@@ -9,6 +9,133 @@ use std::{env, time::Duration};
 
 use crate::cache;
 
+/// Combine two `Usage` values by summing their token counts.
+pub fn combine_usage(a: Usage, b: Usage) -> Usage {
+    Usage {
+        input_tokens: a.input_tokens + b.input_tokens,
+        output_tokens: a.output_tokens + b.output_tokens,
+        total_tokens: a.total_tokens + b.total_tokens,
+    }
+}
+
+/// Dispatch a provider to a callback that receives completion + embedding models.
+///
+/// Usage:
+/// ```ignore
+/// dispatch_provider!(provider, &model_name, embed_override, |m, e| {
+///     do_something(&m, &e).await
+/// })
+/// ```
+#[macro_export]
+macro_rules! dispatch_provider {
+    ($provider:expr, $model_name:expr, $embed_override:expr,
+     |$comp:ident, $embed:ident| $body:expr) => {
+        match $provider {
+            $crate::llm::Provider::Claude => {
+                let client = $crate::llm::anthropic_client_from_env()?;
+                let $comp = ::rig::client::CompletionClient::completion_model(&client, $model_name);
+                let $embed = $crate::llm::NullEmbeddingModel;
+                $body
+            }
+            $crate::llm::Provider::OpenAI => {
+                let client = $crate::llm::openai_client_from_env()?;
+                let $comp = ::rig::client::CompletionClient::completion_model(&client, $model_name);
+                let embed_name = $embed_override
+                    .or_else(|| $crate::llm::Provider::OpenAI.default_embedding_model().map(String::from))
+                    .unwrap();
+                let $embed = ::rig::client::EmbeddingsClient::embedding_model(&client, &embed_name);
+                $body
+            }
+            $crate::llm::Provider::Gemini => {
+                let client = $crate::llm::gemini_client_from_env()?;
+                let $comp = ::rig::client::CompletionClient::completion_model(&client, $model_name);
+                let embed_name = $embed_override
+                    .or_else(|| $crate::llm::Provider::Gemini.default_embedding_model().map(String::from))
+                    .unwrap();
+                let $embed = ::rig::client::EmbeddingsClient::embedding_model(&client, &embed_name);
+                $body
+            }
+            $crate::llm::Provider::Ollama => {
+                let client = $crate::llm::ollama_client_from_env()?;
+                let $comp = ::rig::client::CompletionClient::completion_model(&client, $model_name);
+                if let Some(embed_name) = $embed_override
+                    .or_else(|| $crate::llm::Provider::Ollama.default_embedding_model().map(String::from))
+                {
+                    let $embed = ::rig::client::EmbeddingsClient::embedding_model(&client, &embed_name);
+                    $body
+                } else {
+                    let $embed = $crate::llm::NullEmbeddingModel;
+                    $body
+                }
+            }
+            $crate::llm::Provider::DeepSeek => {
+                let client = $crate::llm::deepseek_client_from_env()?;
+                let $comp = ::rig::client::CompletionClient::completion_model(&client, $model_name);
+                let $embed = $crate::llm::NullEmbeddingModel;
+                $body
+            }
+            $crate::llm::Provider::Groq => {
+                let client = $crate::llm::groq_client_from_env()?;
+                let $comp = ::rig::client::CompletionClient::completion_model(&client, $model_name);
+                let $embed = $crate::llm::NullEmbeddingModel;
+                $body
+            }
+            $crate::llm::Provider::XAI => {
+                let client = $crate::llm::xai_client_from_env()?;
+                let $comp = ::rig::client::CompletionClient::completion_model(&client, $model_name);
+                let $embed = $crate::llm::NullEmbeddingModel;
+                $body
+            }
+        }
+    };
+}
+
+/// Dispatch a provider to a callback that receives only a completion model.
+///
+/// Simpler variant for code that doesn't need embeddings.
+#[macro_export]
+macro_rules! dispatch_completion {
+    ($provider:expr, $model_name:expr, |$comp:ident| $body:expr) => {
+        match $provider {
+            $crate::llm::Provider::Claude => {
+                let client = $crate::llm::anthropic_client_from_env()?;
+                let $comp = ::rig::client::CompletionClient::completion_model(&client, $model_name);
+                $body
+            }
+            $crate::llm::Provider::OpenAI => {
+                let client = $crate::llm::openai_client_from_env()?;
+                let $comp = ::rig::client::CompletionClient::completion_model(&client, $model_name);
+                $body
+            }
+            $crate::llm::Provider::Gemini => {
+                let client = $crate::llm::gemini_client_from_env()?;
+                let $comp = ::rig::client::CompletionClient::completion_model(&client, $model_name);
+                $body
+            }
+            $crate::llm::Provider::Ollama => {
+                let client = $crate::llm::ollama_client_from_env()?;
+                let $comp = ::rig::client::CompletionClient::completion_model(&client, $model_name);
+                $body
+            }
+            $crate::llm::Provider::DeepSeek => {
+                let client = $crate::llm::deepseek_client_from_env()?;
+                let $comp = ::rig::client::CompletionClient::completion_model(&client, $model_name);
+                $body
+            }
+            $crate::llm::Provider::Groq => {
+                let client = $crate::llm::groq_client_from_env()?;
+                let $comp = ::rig::client::CompletionClient::completion_model(&client, $model_name);
+                $body
+            }
+            $crate::llm::Provider::XAI => {
+                let client = $crate::llm::xai_client_from_env()?;
+                let $comp = ::rig::client::CompletionClient::completion_model(&client, $model_name);
+                $body
+            }
+        }
+    };
+}
+
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
@@ -93,6 +220,7 @@ pub struct CacheConfig {
     pub provider_name: String,
     pub model_name: String,
     pub enabled: bool,
+    pub max_age: Option<std::time::Duration>,
 }
 
 #[derive(Debug)]
@@ -336,7 +464,7 @@ fn try_cache_get(cache: Option<&CacheConfig>, preamble: &str, prompt: &str, temp
     if let Some(config) = cache {
         if config.enabled {
             let key = cache::cache_key(&config.provider_name, &config.model_name, preamble, prompt, temperature, schema_name);
-            return cache::get_cached(&key);
+            return cache::get_cached(&key, config.max_age);
         }
     }
     Ok(None)
@@ -914,7 +1042,7 @@ mod tests {
         cache::set_cached_at(&cache_dir, &key, "cached response").unwrap();
 
         // Override the default cache dir for this test by directly testing try_cache_get
-        let result = cache::get_cached_at(&cache_dir, &key).unwrap();
+        let result = cache::get_cached_at(&cache_dir, &key, None).unwrap();
         assert_eq!(result, Some("cached response".to_string()));
     }
 
@@ -924,6 +1052,7 @@ mod tests {
             provider_name: "claude".to_string(),
             model_name: "sonnet".to_string(),
             enabled: true,
+            max_age: None,
         };
         let cloned = config.clone();
         assert_eq!(cloned.provider_name, "claude");

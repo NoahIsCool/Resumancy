@@ -1,8 +1,8 @@
 use anyhow::Context;
+use rig::completion::{CompletionModel, Usage};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use rig::completion::CompletionModel;
-use crate::llm::{prompt_structured, CacheConfig, Provider};
+use crate::llm::{prompt_structured, combine_usage, CacheConfig, Provider};
 use crate::prompts;
 use crate::kb::load_kb;
 
@@ -44,7 +44,7 @@ pub async fn get_job_needs<M: CompletionModel + Clone>(
     completion_model: &M,
     provider: Provider,
     cache: Option<&CacheConfig>,
-) -> Result<JobNeeds, anyhow::Error> {
+) -> Result<(JobNeeds, Usage), anyhow::Error> {
     let job_prompt = format!("JOB POSTING:\n{}\n", job_text);
 
     let result = prompt_structured(
@@ -56,7 +56,7 @@ pub async fn get_job_needs<M: CompletionModel + Clone>(
         cache,
     ).await?;
 
-    Ok(result.value)
+    Ok((result.value, result.usage))
 }
 
 #[tracing::instrument(skip_all)]
@@ -65,8 +65,8 @@ pub async fn evaluate_candidate<M: CompletionModel + Clone>(
     completion_model: &M,
     provider: Provider,
     cache: Option<&CacheConfig>,
-) -> Result<SkillFocusList, anyhow::Error> {
-    let job_needs = get_job_needs(job_text, completion_model, provider, cache).await?;
+) -> Result<(SkillFocusList, Usage), anyhow::Error> {
+    let (job_needs, usage1) = get_job_needs(job_text, completion_model, provider, cache).await?;
 
     let job_needs_str =
         serde_json::to_string_pretty(&job_needs).context("failed to serialize job needs")?;
@@ -76,12 +76,31 @@ pub async fn evaluate_candidate<M: CompletionModel + Clone>(
     }
 
 
-    let kb = load_kb()?.skills;
-    let context = kb
+    let kb = load_kb()?;
+    let stories_context = kb.skills
         .iter()
-        .map(|skill | format!("- {} ({}): {}", skill.company, skill.year, skill.text))
+        .map(|skill| format!("- {} ({}): {}", skill.company, skill.year, skill.text))
         .collect::<Vec<_>>()
         .join("\n");
+
+    let profile_context = match &kb.user_profile {
+        Some(p) => {
+            let mut parts = Vec::new();
+            for edu in &p.education {
+                parts.push(format!("- Education: {} ({})", edu.degree, edu.graduation_date));
+            }
+            for job in &p.jobs {
+                parts.push(format!("- {} — {}, {} ({} to {})", job.company, job.title, job.location, job.start_date, job.end_date));
+            }
+            parts.join("\n")
+        }
+        None => String::new(),
+    };
+
+    let mut context = stories_context;
+    if !profile_context.is_empty() {
+        context = format!("{}\n\n{}", profile_context, context);
+    }
 
     // 3) Identify skill gaps with structured outputs
     let skill_plan_prompt = format!(
@@ -98,5 +117,74 @@ pub async fn evaluate_candidate<M: CompletionModel + Clone>(
         cache,
     ).await?;
 
-    Ok(result.value)
+    Ok((result.value, combine_usage(usage1, result.usage)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_needs_deserializes() {
+        let json = r#"{
+            "skills": [
+                {
+                    "title": "Rust",
+                    "description": "Systems programming",
+                    "skill_description": "Rust language proficiency",
+                    "need": 8
+                },
+                {
+                    "title": "Python",
+                    "description": "Scripting",
+                    "skill_description": "Python scripting",
+                    "need": 5
+                }
+            ]
+        }"#;
+        let needs: JobNeeds = serde_json::from_str(json).expect("parse");
+        assert_eq!(needs.skills.len(), 2);
+        assert_eq!(needs.skills[0].title, "Rust");
+        assert_eq!(needs.skills[0].need, 8);
+        assert_eq!(needs.skills[1].title, "Python");
+    }
+
+    #[test]
+    fn skill_focus_list_deserializes() {
+        let json = r#"{
+            "summary": "Strong candidate overall",
+            "skills": [
+                {
+                    "title": "ML",
+                    "description": "Machine learning",
+                    "need": 9,
+                    "suitability": 7,
+                    "skill_description": "ML engineering",
+                    "justification": "Good research background"
+                }
+            ]
+        }"#;
+        let list: SkillFocusList = serde_json::from_str(json).expect("parse");
+        assert_eq!(list.summary, "Strong candidate overall");
+        assert_eq!(list.skills.len(), 1);
+        assert_eq!(list.skills[0].need, 9);
+        assert_eq!(list.skills[0].suitability, 7);
+    }
+
+    #[test]
+    fn skill_need_fields_correctly_typed() {
+        let json = r#"{
+            "title": "Go",
+            "description": "Backend development",
+            "need": 6,
+            "suitability": 3,
+            "skill_description": "Go programming",
+            "justification": "Limited experience"
+        }"#;
+        let skill: SkillNeed = serde_json::from_str(json).expect("parse");
+        assert_eq!(skill.title, "Go");
+        assert_eq!(skill.need, 6);
+        assert_eq!(skill.suitability, 3);
+        assert_eq!(skill.justification, "Limited experience");
+    }
 }

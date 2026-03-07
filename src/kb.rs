@@ -69,8 +69,9 @@ pub struct Story {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
-#[schemars(deny_unknown_fields)]
 pub struct UserSkillStore {
+    #[serde(default)]
+    pub embedding_model: Option<String>,
     pub skills: Vec<Story>,
     #[serde(default)]
     pub user_profile: Option<UserProfile>,
@@ -212,6 +213,7 @@ pub fn load_kb_at(path: &Path) -> anyhow::Result<UserSkillStore> {
         Ok(contents) => contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             return Ok(UserSkillStore {
+                embedding_model: None,
                 skills: Vec::new(),
                 user_profile: None,
             })
@@ -413,6 +415,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("kb.json");
         let store = UserSkillStore {
+            embedding_model: None,
             skills: vec![Story {
                 company: "Acme".to_string(),
                 year: "2022".to_string(),
@@ -455,6 +458,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("nested").join("kb.json");
         let store = UserSkillStore {
+            embedding_model: None,
             skills: Vec::new(),
             user_profile: None,
         };
@@ -467,6 +471,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("kb.json");
         let store = UserSkillStore {
+            embedding_model: None,
             skills: vec![
                 Story {
                     company: "Acme".to_string(),
@@ -501,6 +506,7 @@ mod tests {
         save_kb_at(
             &path,
             &UserSkillStore {
+                embedding_model: None,
                 skills: Vec::new(),
                 user_profile: None,
             },
@@ -531,6 +537,7 @@ mod tests {
         save_kb_at(
             &path,
             &UserSkillStore {
+                embedding_model: None,
                 skills: Vec::new(),
                 user_profile: None,
             },
@@ -588,6 +595,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("kb.json");
         let store = UserSkillStore {
+            embedding_model: None,
             skills: vec![
                 Story {
                     company: "Far".to_string(),
@@ -623,6 +631,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("kb.json");
         let store = UserSkillStore {
+            embedding_model: None,
             skills: vec![
                 Story { company: "A".into(), year: "2020".into(), text: "a".into(), vector: vec![1.0, 0.0] },
                 Story { company: "B".into(), year: "2021".into(), text: "b".into(), vector: vec![0.9, 0.1] },
@@ -638,5 +647,31 @@ mod tests {
             .expect("retrieve");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].company, "A");
+    }
+
+    #[test]
+    fn backward_compat_loads_without_embedding_model_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kb.json");
+        // JSON without embedding_model field — simulates old format
+        let json = r#"{"skills":[],"user_profile":null}"#;
+        fs::write(&path, json).expect("write");
+        let store = load_kb_at(&path).expect("load");
+        assert!(store.embedding_model.is_none());
+        assert!(store.skills.is_empty());
+    }
+
+    #[test]
+    fn embedding_model_field_roundtrips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kb.json");
+        let store = UserSkillStore {
+            embedding_model: Some("text-embedding-3-small".to_string()),
+            skills: Vec::new(),
+            user_profile: None,
+        };
+        save_kb_at(&path, &store).expect("save");
+        let loaded = load_kb_at(&path).expect("load");
+        assert_eq!(loaded.embedding_model.as_deref(), Some("text-embedding-3-small"));
     }
 }

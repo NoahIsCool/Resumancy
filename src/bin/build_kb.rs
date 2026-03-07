@@ -2,11 +2,10 @@ use std::{fs, path::Path};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use rig::client::{CompletionClient, EmbeddingsClient};
 use rig::completion::CompletionModel;
 use rig::embeddings::EmbeddingModel;
 use pipelines::kb::{story_document, Story, UserSkillStore, UserSkillStoreSeed, DEFAULT_KB_PATH};
-use pipelines::llm::{self, prompt_structured, CacheConfig, Provider, NullEmbeddingModel};
+use pipelines::llm::{prompt_structured, CacheConfig, Provider};
 
 const KB_PREAMBLE: &str = r#"Role: You are a resume parsing assistant.
 Goal: Build an initial skills knowledge base from the resume.
@@ -37,6 +36,10 @@ struct Args {
     /// Disable response caching
     #[arg(long, default_value_t = false)]
     no_cache: bool,
+
+    /// Cache TTL in seconds (entries older than this are treated as misses)
+    #[arg(long)]
+    cache_ttl: Option<u64>,
 
     /// Path to the resume text file
     resume_path: String,
@@ -77,6 +80,7 @@ where
         });
     }
     let store = UserSkillStore {
+        embedding_model: Some(model_name.to_string()),
         skills,
         user_profile: None,
     };
@@ -118,64 +122,11 @@ async fn main() -> Result<()> {
         provider_name: args.provider.name().to_string(),
         model_name: model_name.clone(),
         enabled: !args.no_cache,
+        max_age: args.cache_ttl.map(std::time::Duration::from_secs),
     };
     let cache_opt = Some(&cache);
 
-    match args.provider {
-        Provider::Claude => {
-            let client = llm::anthropic_client_from_env()?;
-            let model = client.completion_model(&model_name);
-            let embed = NullEmbeddingModel;
-            build_kb(&resume_raw, &model_name, &model, &embed, &args.output_path, args.provider, cache_opt).await
-        }
-        Provider::OpenAI => {
-            let client = llm::openai_client_from_env()?;
-            let model = client.completion_model(&model_name);
-            let embed_name = args.embedding_model.clone()
-                .or_else(|| Provider::OpenAI.default_embedding_model().map(String::from))
-                .unwrap();
-            let embed_model = client.embedding_model(&embed_name);
-            build_kb(&resume_raw, &model_name, &model, &embed_model, &args.output_path, args.provider, cache_opt).await
-        }
-        Provider::Gemini => {
-            let client = llm::gemini_client_from_env()?;
-            let model = client.completion_model(&model_name);
-            let embed_name = args.embedding_model.clone()
-                .or_else(|| Provider::Gemini.default_embedding_model().map(String::from))
-                .unwrap();
-            let embed_model = client.embedding_model(&embed_name);
-            build_kb(&resume_raw, &model_name, &model, &embed_model, &args.output_path, args.provider, cache_opt).await
-        }
-        Provider::Ollama => {
-            let client = llm::ollama_client_from_env()?;
-            let model = client.completion_model(&model_name);
-            if let Some(embed_name) = args.embedding_model.clone()
-                .or_else(|| Provider::Ollama.default_embedding_model().map(String::from))
-            {
-                let embed_model = client.embedding_model(&embed_name);
-                build_kb(&resume_raw, &model_name, &model, &embed_model, &args.output_path, args.provider, cache_opt).await
-            } else {
-                let embed = NullEmbeddingModel;
-                build_kb(&resume_raw, &model_name, &model, &embed, &args.output_path, args.provider, cache_opt).await
-            }
-        }
-        Provider::DeepSeek => {
-            let client = llm::deepseek_client_from_env()?;
-            let model = client.completion_model(&model_name);
-            let embed = NullEmbeddingModel;
-            build_kb(&resume_raw, &model_name, &model, &embed, &args.output_path, args.provider, cache_opt).await
-        }
-        Provider::Groq => {
-            let client = llm::groq_client_from_env()?;
-            let model = client.completion_model(&model_name);
-            let embed = NullEmbeddingModel;
-            build_kb(&resume_raw, &model_name, &model, &embed, &args.output_path, args.provider, cache_opt).await
-        }
-        Provider::XAI => {
-            let client = llm::xai_client_from_env()?;
-            let model = client.completion_model(&model_name);
-            let embed = NullEmbeddingModel;
-            build_kb(&resume_raw, &model_name, &model, &embed, &args.output_path, args.provider, cache_opt).await
-        }
-    }
+    pipelines::dispatch_provider!(args.provider, &model_name, args.embedding_model.clone(), |model, embed| {
+        build_kb(&resume_raw, &model_name, &model, &embed, &args.output_path, args.provider, cache_opt).await
+    })
 }

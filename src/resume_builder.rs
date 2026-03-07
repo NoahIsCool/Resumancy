@@ -2,11 +2,11 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 use anyhow::{anyhow, Context};
-use rig::completion::CompletionModel;
+use rig::completion::{CompletionModel, Usage};
 use crate::{eval, kb, prompts};
 use crate::kb::UserProfile;
 use crate::hiring_manager::SkillFocusList;
-use crate::llm::{prompt_text_with_temperature, prompt_text_streaming, strip_code_fences, CacheConfig, Provider};
+use crate::llm::{prompt_text_with_temperature, prompt_text_streaming, strip_code_fences, combine_usage, CacheConfig, Provider};
 
 const MAX_LATEX_FIXES: usize = 3;
 const TOP_STORIES_PER_SKILL: usize = 50;
@@ -153,7 +153,8 @@ async fn fix_and_save_latex<M: CompletionModel + Clone>(
     resume_latex: &mut String,
     completion_model: &M,
     cache: Option<&CacheConfig>,
-) -> anyhow::Result<()>{
+) -> anyhow::Result<Usage>{
+    let mut total_usage = Usage::default();
 
     let output_tex = out_dir.join(format!("{}.tex", tex_filename));
     let output_pdf = out_dir.join(format!("{}.pdf", tex_filename));
@@ -206,11 +207,12 @@ async fn fix_and_save_latex<M: CompletionModel + Clone>(
             "LATEX DOCUMENT:\n{}\n\nCOMPILER OUTPUT:\n{}\n",
             resume_latex, compile_tail
         );
-        let raw = prompt_text_with_temperature(completion_model, prompts::RESUME_FIX_PREAMBLE, &fix_prompt, 0.4, cache).await?.value;
-        *resume_latex = strip_code_fences(&raw).to_string();
+        let fix_result = prompt_text_with_temperature(completion_model, prompts::RESUME_FIX_PREAMBLE, &fix_prompt, 0.4, cache).await?;
+        total_usage = combine_usage(total_usage, fix_result.usage);
+        *resume_latex = strip_code_fences(&fix_result.value).to_string();
     }
 
-    Ok(())
+    Ok(total_usage)
 }
 
 #[tracing::instrument(skip_all)]
@@ -226,7 +228,9 @@ pub async fn build_resume<M: CompletionModel + Clone>(
     run_eval: bool,
     stream: bool,
     cache: Option<&CacheConfig>,
-) -> anyhow::Result<Option<eval::ResumeEvaluation>> {
+) -> anyhow::Result<(Option<eval::ResumeEvaluation>, Usage)> {
+    let mut total_usage = Usage::default();
+
     let skill_priorities = format_skill_priorities(skill_assessment);
     let matched_stories = build_matched_stories_context(skill_assessment, embed_model).await?;
     let user_profile_context = format_user_profile(&user_profile);
@@ -247,7 +251,9 @@ pub async fn build_resume<M: CompletionModel + Clone>(
     let raw = if stream {
         prompt_text_streaming(completion_model, prompts::RESUME_BUILD_PREAMBLE, &resume_prompt, 0.4, cache).await?
     } else {
-        prompt_text_with_temperature(completion_model, prompts::RESUME_BUILD_PREAMBLE, &resume_prompt, 0.4, cache).await?.value
+        let result = prompt_text_with_temperature(completion_model, prompts::RESUME_BUILD_PREAMBLE, &resume_prompt, 0.4, cache).await?;
+        total_usage = combine_usage(total_usage, result.usage);
+        result.value
     };
     let mut resume_latex = strip_code_fences(&raw).to_string();
 
@@ -287,9 +293,10 @@ pub async fn build_resume<M: CompletionModel + Clone>(
             .with_context(|| format!("failed to create output directory: {}", out_dir.display()))?;
     }
 
-    fix_and_save_latex(out_dir, tex_filename, &mut resume_latex, completion_model, cache).await?;
+    let fix_usage = fix_and_save_latex(out_dir, tex_filename, &mut resume_latex, completion_model, cache).await?;
+    total_usage = combine_usage(total_usage, fix_usage);
 
-    Ok(evaluation)
+    Ok((evaluation, total_usage))
 }
 
 #[tracing::instrument(skip_all)]
@@ -303,7 +310,9 @@ pub async fn build_cover_letter<M: CompletionModel + Clone>(
     embed_model: &impl rig::embeddings::EmbeddingModel,
     stream: bool,
     cache: Option<&CacheConfig>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Usage> {
+    let mut total_usage = Usage::default();
+
     let skill_priorities = format_skill_priorities(skill_assessment);
     let matched_stories = build_matched_stories_context(skill_assessment, embed_model).await?;
     let user_profile_context = format_user_profile(user_profile);
@@ -323,7 +332,9 @@ pub async fn build_cover_letter<M: CompletionModel + Clone>(
     let raw = if stream {
         prompt_text_streaming(completion_model, prompts::COVER_LETTER_PREAMBLE, &cover_letter_prompt, 0.4, cache).await?
     } else {
-        prompt_text_with_temperature(completion_model, prompts::COVER_LETTER_PREAMBLE, &cover_letter_prompt, 0.4, cache).await?.value
+        let result = prompt_text_with_temperature(completion_model, prompts::COVER_LETTER_PREAMBLE, &cover_letter_prompt, 0.4, cache).await?;
+        total_usage = combine_usage(total_usage, result.usage);
+        result.value
     };
     let mut cover_latex = strip_code_fences(&raw).to_string();
 
@@ -332,9 +343,10 @@ pub async fn build_cover_letter<M: CompletionModel + Clone>(
             .with_context(|| format!("failed to create output directory: {}", out_dir.display()))?;
     }
 
-    fix_and_save_latex(out_dir, tex_filename, &mut cover_latex, completion_model, cache).await?;
+    let fix_usage = fix_and_save_latex(out_dir, tex_filename, &mut cover_latex, completion_model, cache).await?;
+    total_usage = combine_usage(total_usage, fix_usage);
 
-    Ok(())
+    Ok(total_usage)
 }
 
 #[cfg(test)]

@@ -98,14 +98,32 @@ fn adjacent_fallback_question(skill: &SkillNeed) -> String {
     )
 }
 
-async fn collect_story_for_skill<M>(model: &M, skill: &SkillNeed, provider: Provider) -> anyhow::Result<Option<ParsedStory>>
+async fn collect_story_for_skill<M>(
+    model: &M,
+    skill: &SkillNeed,
+    related_skills: usize,
+    embed_model: &impl rig::embeddings::EmbeddingModel,
+    provider: Provider,
+) -> anyhow::Result<Option<ParsedStory>>
 where
     M: CompletionModel + Clone,
 {
     println!("Target skill: {}", skill.title);
     println!("Skill description: {}", skill.skill_description);
+
+    if related_skills > 0 {
+        let query = format!("{}: {}", skill.title, skill.skill_description);
+        let stories = kb::retrieve_relevant_stories(&query, related_skills, embed_model).await?;
+        if !stories.is_empty() {
+            println!("\nClosest existing stories in your knowledge base:");
+            for (i, story) in stories.iter().enumerate() {
+                println!("  {}. {} ({}): {}", i + 1, story.company, story.year, story.text);
+            }
+        }
+    }
+
     println!(
-        "Share one story that demonstrates this skill. Include:\n\
+        "\nShare one story that demonstrates this skill. Include:\n\
 - company\n- year (or \"unknown\")\n- story text (1-3 sentences)\n\
 Finish with an empty line."
     );
@@ -196,6 +214,7 @@ Finish with an empty line."
 pub async fn fill_skill_gaps<M: CompletionModel + Clone>(
     skill_assessment: &SkillFocusList,
     gap_threshold: i16,
+    related_skills: usize,
     completion_model: &M,
     embed_model: &impl rig::embeddings::EmbeddingModel,
     provider: Provider,
@@ -221,7 +240,7 @@ pub async fn fill_skill_gaps<M: CompletionModel + Clone>(
             skill.suitability,
         );
 
-        let parsed = collect_story_for_skill(completion_model, skill, provider).await?;
+        let parsed = collect_story_for_skill(completion_model, skill, related_skills, embed_model, provider).await?;
         let Some(parsed) = parsed else {
             println!("Skipped");
             continue;
