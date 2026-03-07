@@ -2,7 +2,7 @@ use anyhow::Context;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use rig::completion::CompletionModel;
-use crate::llm::{prompt_structured, Provider};
+use crate::llm::{prompt_structured, CacheConfig, Provider};
 use crate::prompts;
 use crate::kb::load_kb;
 
@@ -39,27 +39,38 @@ pub struct SkillNeed {
     pub justification: String, // a short justification of the candidate's ranking in this skill area.
 }
 
-pub async fn get_job_needs<M: CompletionModel + Clone>(job_text: &String, completion_model: &M, provider: Provider) -> Result<JobNeeds, anyhow::Error> {
+pub async fn get_job_needs<M: CompletionModel + Clone>(
+    job_text: &String,
+    completion_model: &M,
+    provider: Provider,
+    cache: Option<&CacheConfig>,
+) -> Result<JobNeeds, anyhow::Error> {
     let job_prompt = format!("JOB POSTING:\n{}\n", job_text);
 
-    let job_needs: JobNeeds = prompt_structured(
+    let result = prompt_structured(
         completion_model,
         prompts::JOB_POST_PREAMBLE,
         &job_prompt,
         "job_needs_list",
         provider,
+        cache,
     ).await?;
 
-    Ok(job_needs)
+    Ok(result.value)
 }
 
-pub async fn evaluate_candidate<M: CompletionModel + Clone>(job_text: &String, completion_model: &M, provider: Provider) -> Result<SkillFocusList, anyhow::Error> {
-    let job_needs = get_job_needs(job_text, completion_model, provider).await?;
+#[tracing::instrument(skip_all)]
+pub async fn evaluate_candidate<M: CompletionModel + Clone>(
+    job_text: &String,
+    completion_model: &M,
+    provider: Provider,
+    cache: Option<&CacheConfig>,
+) -> Result<SkillFocusList, anyhow::Error> {
+    let job_needs = get_job_needs(job_text, completion_model, provider, cache).await?;
 
     let job_needs_str =
         serde_json::to_string_pretty(&job_needs).context("failed to serialize job needs")?;
     for (idx, skill) in job_needs.skills.iter().enumerate() {
-        // println!("{}", skill);
         println!("{}. {}{:?}", idx + 1, skill.need, skill.title);
         println!("\tdescription: {}", skill.description);
     }
@@ -78,13 +89,14 @@ pub async fn evaluate_candidate<M: CompletionModel + Clone>(job_text: &String, c
         job_needs_str, context
     );
 
-    let skill_plan: SkillFocusList = prompt_structured(
+    let result = prompt_structured(
         completion_model,
         prompts::EVALUATION_PREAMBLE,
         &skill_plan_prompt,
         "skill_focus_list",
         provider,
+        cache,
     ).await?;
-    
-    Ok(skill_plan)
+
+    Ok(result.value)
 }

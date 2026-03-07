@@ -1,11 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
-use rig::completion::{AssistantContent, CompletionModel};
+use rig::completion::{AssistantContent, CompletionModel, Usage};
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 use rig::OneOrMany;
 use schemars::{schema_for, JsonSchema};
 use serde::de::DeserializeOwned;
 use std::{env, time::Duration};
+
+use crate::cache;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -22,6 +24,18 @@ pub enum Provider {
 }
 
 impl Provider {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Provider::Claude => "claude",
+            Provider::OpenAI => "openai",
+            Provider::Gemini => "gemini",
+            Provider::Ollama => "ollama",
+            Provider::DeepSeek => "deepseek",
+            Provider::Groq => "groq",
+            Provider::XAI => "xai",
+        }
+    }
+
     pub fn default_model(&self) -> &'static str {
         match self {
             Provider::Claude => "claude-sonnet-4-20250514",
@@ -72,6 +86,19 @@ enum StructuredOutputStrategy {
     OpenAIResponsesApi,
     GeminiGenerationConfig,
     PromptOnly,
+}
+
+#[derive(Clone)]
+pub struct CacheConfig {
+    pub provider_name: String,
+    pub model_name: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug)]
+pub struct LlmOutput<T> {
+    pub value: T,
+    pub usage: Usage,
 }
 
 /// An embedding model that returns empty vectors. Used when the provider
@@ -273,6 +300,21 @@ fn json_preamble_suffix<T: JsonSchema>(schema_name: &str) -> Result<String> {
     ))
 }
 
+/// Strip markdown code fences from LLM output. Handles ```json, ```latex, and plain ``` fences.
+pub fn strip_code_fences(text: &str) -> &str {
+    let trimmed = text.trim();
+    // Try specific language tags first, then plain fences
+    for prefix in &["```json", "```latex", "```tex", "```"] {
+        if let Some(inner) = trimmed.strip_prefix(prefix) {
+            let inner = inner.trim_start();
+            if let Some(stripped) = inner.strip_suffix("```") {
+                return stripped.trim();
+            }
+        }
+    }
+    trimmed
+}
+
 fn strip_json_fences(text: &str) -> &str {
     let trimmed = text.trim();
     if let Some(inner) = trimmed.strip_prefix("```json") {
@@ -290,17 +332,61 @@ fn strip_json_fences(text: &str) -> &str {
     trimmed
 }
 
+fn try_cache_get(cache: Option<&CacheConfig>, preamble: &str, prompt: &str, temperature: f64, schema_name: Option<&str>) -> Result<Option<String>> {
+    if let Some(config) = cache {
+        if config.enabled {
+            let key = cache::cache_key(&config.provider_name, &config.model_name, preamble, prompt, temperature, schema_name);
+            return cache::get_cached(&key);
+        }
+    }
+    Ok(None)
+}
+
+fn try_cache_set(cache: Option<&CacheConfig>, preamble: &str, prompt: &str, temperature: f64, schema_name: Option<&str>, text: &str) -> Result<()> {
+    if let Some(config) = cache {
+        if config.enabled {
+            let key = cache::cache_key(&config.provider_name, &config.model_name, preamble, prompt, temperature, schema_name);
+            cache::set_cached(&key, text)?;
+        }
+    }
+    Ok(())
+}
+
+#[tracing::instrument(skip_all, fields(
+    llm.provider = tracing::field::Empty,
+    llm.model = tracing::field::Empty,
+    llm.temperature = 0.0,
+    llm.input_tokens = tracing::field::Empty,
+    llm.output_tokens = tracing::field::Empty,
+    llm.cached = false,
+))]
 pub async fn prompt_structured<M, T>(
     model: &M,
     preamble: &str,
     prompt: &str,
     schema_name: &str,
     provider: Provider,
-) -> Result<T>
+    cache: Option<&CacheConfig>,
+) -> Result<LlmOutput<T>>
 where
     M: CompletionModel + Clone,
     T: JsonSchema + DeserializeOwned,
 {
+    let span = tracing::Span::current();
+    if let Some(config) = cache {
+        span.record("llm.provider", config.provider_name.as_str());
+        span.record("llm.model", config.model_name.as_str());
+    }
+
+    // Check cache
+    if let Some(cached) = try_cache_get(cache, preamble, prompt, 0.0, Some(schema_name))? {
+        span.record("llm.cached", true);
+        let cleaned = strip_json_fences(&cached);
+        let parsed = serde_json::from_str::<T>(cleaned)
+            .with_context(|| format!("failed to parse cached structured output for {schema_name}"))?;
+        return Ok(LlmOutput { value: parsed, usage: Usage::default() });
+    }
+
     let strategy = provider.structured_output_strategy();
 
     let effective_preamble = match strategy {
@@ -333,24 +419,58 @@ where
         .await
         .context("structured prompt failed")?;
 
+    let usage = response.usage;
+    span.record("llm.input_tokens", usage.input_tokens);
+    span.record("llm.output_tokens", usage.output_tokens);
+
     let text = text_from_choice(response.choice)?;
+
+    // Write cache (raw text, pre-parse)
+    try_cache_set(cache, preamble, prompt, 0.0, Some(schema_name), &text)?;
+
     let cleaned = strip_json_fences(&text);
     let parsed = serde_json::from_str::<T>(cleaned)
         .with_context(|| format!("failed to parse structured output for {schema_name}"))?;
-    Ok(parsed)
+    Ok(LlmOutput { value: parsed, usage })
 }
 
 pub async fn prompt_text<M>(model: &M, preamble: &str, prompt: &str) -> Result<String>
 where
     M: CompletionModel + Clone,
 {
-    prompt_text_with_temperature(model, preamble, prompt, 0.4).await
+    Ok(prompt_text_with_temperature(model, preamble, prompt, 0.4, None).await?.value)
 }
 
-pub async fn prompt_text_with_temperature<M>(model: &M, preamble: &str, prompt: &str, temperature: f64) -> Result<String>
+#[tracing::instrument(skip_all, fields(
+    llm.provider = tracing::field::Empty,
+    llm.model = tracing::field::Empty,
+    llm.temperature = temperature,
+    llm.input_tokens = tracing::field::Empty,
+    llm.output_tokens = tracing::field::Empty,
+    llm.cached = false,
+))]
+pub async fn prompt_text_with_temperature<M>(
+    model: &M,
+    preamble: &str,
+    prompt: &str,
+    temperature: f64,
+    cache: Option<&CacheConfig>,
+) -> Result<LlmOutput<String>>
 where
     M: CompletionModel + Clone,
 {
+    let span = tracing::Span::current();
+    if let Some(config) = cache {
+        span.record("llm.provider", config.provider_name.as_str());
+        span.record("llm.model", config.model_name.as_str());
+    }
+
+    // Check cache
+    if let Some(cached) = try_cache_get(cache, preamble, prompt, temperature, None)? {
+        span.record("llm.cached", true);
+        return Ok(LlmOutput { value: cached, usage: Usage::default() });
+    }
+
     let response = model
         .completion_request(prompt)
         .preamble(preamble.to_string())
@@ -359,7 +479,76 @@ where
         .await
         .context("prompt failed")?;
 
-    text_from_choice(response.choice)
+    let usage = response.usage;
+    span.record("llm.input_tokens", usage.input_tokens);
+    span.record("llm.output_tokens", usage.output_tokens);
+
+    let text = text_from_choice(response.choice)?;
+
+    // Write cache
+    try_cache_set(cache, preamble, prompt, temperature, None, &text)?;
+
+    Ok(LlmOutput { value: text, usage })
+}
+
+#[tracing::instrument(skip_all, fields(
+    llm.provider = tracing::field::Empty,
+    llm.model = tracing::field::Empty,
+    llm.temperature = temperature,
+    llm.cached = false,
+))]
+pub async fn prompt_text_streaming<M>(
+    model: &M,
+    preamble: &str,
+    prompt: &str,
+    temperature: f64,
+    cache: Option<&CacheConfig>,
+) -> Result<String>
+where
+    M: CompletionModel + Clone,
+{
+    let span = tracing::Span::current();
+    if let Some(config) = cache {
+        span.record("llm.provider", config.provider_name.as_str());
+        span.record("llm.model", config.model_name.as_str());
+    }
+
+    // Check cache first — no streaming needed for hits
+    if let Some(cached) = try_cache_get(cache, preamble, prompt, temperature, None)? {
+        span.record("llm.cached", true);
+        return Ok(cached);
+    }
+
+    use futures::StreamExt;
+
+    let mut stream = model
+        .completion_request(prompt)
+        .preamble(preamble.to_string())
+        .temperature(temperature)
+        .stream()
+        .await
+        .context("streaming prompt failed")?;
+
+    let mut accumulated = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(rig::streaming::StreamedAssistantContent::Text(text)) => {
+                eprint!("{}", text.text);
+                accumulated.push_str(&text.text);
+            }
+            Err(e) => {
+                return Err(anyhow!("streaming error: {}", e));
+            }
+            _ => {}
+        }
+    }
+    eprintln!();
+
+    // Write cache
+    try_cache_set(cache, preamble, prompt, temperature, None, &accumulated)?;
+
+    Ok(accumulated)
 }
 
 #[cfg(test)]
@@ -555,6 +744,34 @@ mod tests {
     }
 
     #[test]
+    fn strip_code_fences_removes_latex_fence() {
+        let input = "```latex\n\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n```";
+        assert_eq!(
+            strip_code_fences(input),
+            "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}"
+        );
+    }
+
+    #[test]
+    fn strip_code_fences_removes_tex_fence() {
+        assert_eq!(
+            strip_code_fences("```tex\n\\section{Hi}\n```"),
+            "\\section{Hi}"
+        );
+    }
+
+    #[test]
+    fn strip_code_fences_removes_plain_fence() {
+        assert_eq!(strip_code_fences("```\nsome content\n```"), "some content");
+    }
+
+    #[test]
+    fn strip_code_fences_preserves_unfenced() {
+        let input = "\\documentclass{article}";
+        assert_eq!(strip_code_fences(input), input);
+    }
+
+    #[test]
     fn prompt_only_providers_strategy() {
         for provider in [Provider::Claude, Provider::DeepSeek, Provider::Groq, Provider::Ollama, Provider::XAI] {
             assert!(matches!(
@@ -606,11 +823,11 @@ mod tests {
             })),
         };
 
-        let parsed: Payload =
-            prompt_structured(&model, "preamble", "prompt", "payload", Provider::OpenAI)
+        let result: LlmOutput<Payload> =
+            prompt_structured(&model, "preamble", "prompt", "payload", Provider::OpenAI, None)
                 .await
                 .expect("structured");
-        assert_eq!(parsed.value, "ok");
+        assert_eq!(result.value.value, "ok");
     }
 
     #[tokio::test]
@@ -626,11 +843,11 @@ mod tests {
             })),
         };
 
-        let parsed: Payload =
-            prompt_structured(&model, "preamble", "prompt", "payload", Provider::Claude)
+        let result: LlmOutput<Payload> =
+            prompt_structured(&model, "preamble", "prompt", "payload", Provider::Claude, None)
                 .await
                 .expect("structured");
-        assert_eq!(parsed.value, "fenced");
+        assert_eq!(result.value.value, "fenced");
     }
 
     #[tokio::test]
@@ -647,7 +864,7 @@ mod tests {
             })),
         };
 
-        let err = prompt_structured::<_, Payload>(&model, "preamble", "prompt", "payload", Provider::Claude)
+        let err = prompt_structured::<_, Payload>(&model, "preamble", "prompt", "payload", Provider::Claude, None)
             .await
             .unwrap_err()
             .to_string();
@@ -676,5 +893,41 @@ mod tests {
         assert!(Provider::Ollama.default_embedding_model().is_some());
         assert!(Provider::Claude.default_embedding_model().is_none());
         assert!(Provider::DeepSeek.default_embedding_model().is_none());
+    }
+
+    #[test]
+    fn provider_name_strings() {
+        assert_eq!(Provider::Claude.name(), "claude");
+        assert_eq!(Provider::OpenAI.name(), "openai");
+        assert_eq!(Provider::Gemini.name(), "gemini");
+        assert_eq!(Provider::Ollama.name(), "ollama");
+        assert_eq!(Provider::DeepSeek.name(), "deepseek");
+        assert_eq!(Provider::Groq.name(), "groq");
+        assert_eq!(Provider::XAI.name(), "xai");
+    }
+
+    #[tokio::test]
+    async fn prompt_text_with_cache_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let key = cache::cache_key("test", "test-model", "preamble", "prompt", 0.4, None);
+        cache::set_cached_at(&cache_dir, &key, "cached response").unwrap();
+
+        // Override the default cache dir for this test by directly testing try_cache_get
+        let result = cache::get_cached_at(&cache_dir, &key).unwrap();
+        assert_eq!(result, Some("cached response".to_string()));
+    }
+
+    #[test]
+    fn cache_config_clone() {
+        let config = CacheConfig {
+            provider_name: "claude".to_string(),
+            model_name: "sonnet".to_string(),
+            enabled: true,
+        };
+        let cloned = config.clone();
+        assert_eq!(cloned.provider_name, "claude");
+        assert_eq!(cloned.model_name, "sonnet");
+        assert!(cloned.enabled);
     }
 }

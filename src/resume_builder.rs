@@ -3,10 +3,10 @@ use std::path::Path;
 use std::process::Command;
 use anyhow::{anyhow, Context};
 use rig::completion::CompletionModel;
-use crate::{kb, prompts};
+use crate::{eval, kb, prompts};
 use crate::kb::UserProfile;
 use crate::hiring_manager::SkillFocusList;
-use crate::llm::prompt_text;
+use crate::llm::{prompt_text_with_temperature, prompt_text_streaming, strip_code_fences, CacheConfig, Provider};
 
 const MAX_LATEX_FIXES: usize = 3;
 const TOP_STORIES_PER_SKILL: usize = 50;
@@ -152,6 +152,7 @@ async fn fix_and_save_latex<M: CompletionModel + Clone>(
     tex_filename: &str,
     resume_latex: &mut String,
     completion_model: &M,
+    cache: Option<&CacheConfig>,
 ) -> anyhow::Result<()>{
 
     let output_tex = out_dir.join(format!("{}.tex", tex_filename));
@@ -205,13 +206,14 @@ async fn fix_and_save_latex<M: CompletionModel + Clone>(
             "LATEX DOCUMENT:\n{}\n\nCOMPILER OUTPUT:\n{}\n",
             resume_latex, compile_tail
         );
-        *resume_latex =
-            prompt_text(completion_model, prompts::RESUME_FIX_PREAMBLE, &fix_prompt).await?;
+        let raw = prompt_text_with_temperature(completion_model, prompts::RESUME_FIX_PREAMBLE, &fix_prompt, 0.4, cache).await?.value;
+        *resume_latex = strip_code_fences(&raw).to_string();
     }
 
     Ok(())
 }
 
+#[tracing::instrument(skip_all)]
 pub async fn build_resume<M: CompletionModel + Clone>(
     job_text: &String,
     user_profile: UserProfile,
@@ -220,7 +222,11 @@ pub async fn build_resume<M: CompletionModel + Clone>(
     tex_filename: &str,
     completion_model: &M,
     embed_model: &impl rig::embeddings::EmbeddingModel,
-) -> anyhow::Result<()> {
+    provider: Provider,
+    run_eval: bool,
+    stream: bool,
+    cache: Option<&CacheConfig>,
+) -> anyhow::Result<Option<eval::ResumeEvaluation>> {
     let skill_priorities = format_skill_priorities(skill_assessment);
     let matched_stories = build_matched_stories_context(skill_assessment, embed_model).await?;
     let user_profile_context = format_user_profile(&user_profile);
@@ -238,20 +244,55 @@ pub async fn build_resume<M: CompletionModel + Clone>(
         template
     );
 
-    let mut resume_latex = prompt_text(completion_model,
-                                       prompts::RESUME_BUILD_PREAMBLE,
-                                       &resume_prompt).await?;
+    let raw = if stream {
+        prompt_text_streaming(completion_model, prompts::RESUME_BUILD_PREAMBLE, &resume_prompt, 0.4, cache).await?
+    } else {
+        prompt_text_with_temperature(completion_model, prompts::RESUME_BUILD_PREAMBLE, &resume_prompt, 0.4, cache).await?.value
+    };
+    let mut resume_latex = strip_code_fences(&raw).to_string();
+
+    let evaluation = if run_eval {
+        let resume_prompt_clone = resume_prompt.clone();
+        let cache_clone = cache.cloned();
+        let (final_latex, eval_result) = eval::eval_loop(
+            &resume_latex,
+            job_text,
+            completion_model,
+            provider,
+            None,
+            cache,
+            |eval_feedback| {
+                let suggestions = eval_feedback.suggestions.join("\n- ");
+                let weaknesses = eval_feedback.weaknesses.join("\n- ");
+                let regen_prompt = format!(
+                    "{}\n\nPREVIOUS EVALUATION FEEDBACK:\nWeaknesses:\n- {}\n\nSuggestions:\n- {}\n\nPlease regenerate an improved resume.",
+                    resume_prompt_clone, weaknesses, suggestions
+                );
+                let model = completion_model.clone();
+                let cache_inner = cache_clone.clone();
+                async move {
+                    let raw = prompt_text_with_temperature(&model, prompts::RESUME_REGENERATE_PREAMBLE, &regen_prompt, 0.4, cache_inner.as_ref()).await?.value;
+                    Ok(strip_code_fences(&raw).to_string())
+                }
+            },
+        ).await?;
+        resume_latex = final_latex;
+        Some(eval_result)
+    } else {
+        None
+    };
 
     if !out_dir.exists() {
         fs::create_dir_all(out_dir)
             .with_context(|| format!("failed to create output directory: {}", out_dir.display()))?;
     }
 
-    fix_and_save_latex(out_dir, tex_filename, &mut resume_latex, completion_model).await?;
+    fix_and_save_latex(out_dir, tex_filename, &mut resume_latex, completion_model, cache).await?;
 
-    Ok(())
+    Ok(evaluation)
 }
 
+#[tracing::instrument(skip_all)]
 pub async fn build_cover_letter<M: CompletionModel + Clone>(
     job_text: &String,
     user_profile: &UserProfile,
@@ -260,32 +301,38 @@ pub async fn build_cover_letter<M: CompletionModel + Clone>(
     tex_filename: &str,
     completion_model: &M,
     embed_model: &impl rig::embeddings::EmbeddingModel,
+    stream: bool,
+    cache: Option<&CacheConfig>,
 ) -> anyhow::Result<()> {
     let skill_priorities = format_skill_priorities(skill_assessment);
     let matched_stories = build_matched_stories_context(skill_assessment, embed_model).await?;
     let user_profile_context = format_user_profile(user_profile);
 
+    let template = fs::read_to_string("data/cover_letter_template.tex")
+        .context("failed to read cover letter template: data/cover_letter_template.tex")?;
+
     let cover_letter_prompt = format!(
-        "JOB DESCRIPTION:\n{}\n\nSKILL PRIORITIES:\n{}\n\nMATCHED STORIES:\n{}\n\nUSER PROFILE:\n{}\n",
+        "JOB DESCRIPTION:\n{}\n\nSKILL PRIORITIES:\n{}\n\nMATCHED STORIES:\n{}\n\nUSER PROFILE:\n{}\n\nTEMPLATE:\n{}\n",
         job_text,
         skill_priorities,
         matched_stories,
         user_profile_context,
+        template,
     );
 
-    let cover_letter = prompt_text(completion_model,
-                                   prompts::COVER_LETTER_PREAMBLE,
-                                   &cover_letter_prompt).await?;
+    let raw = if stream {
+        prompt_text_streaming(completion_model, prompts::COVER_LETTER_PREAMBLE, &cover_letter_prompt, 0.4, cache).await?
+    } else {
+        prompt_text_with_temperature(completion_model, prompts::COVER_LETTER_PREAMBLE, &cover_letter_prompt, 0.4, cache).await?.value
+    };
+    let mut cover_latex = strip_code_fences(&raw).to_string();
 
     if !out_dir.exists() {
         fs::create_dir_all(out_dir)
             .with_context(|| format!("failed to create output directory: {}", out_dir.display()))?;
     }
 
-    let output_path = out_dir.join(format!("{}_cover_letter.txt", tex_filename));
-    fs::write(&output_path, &cover_letter)
-        .with_context(|| format!("failed to write cover letter to {}", output_path.display()))?;
-    println!("Wrote cover letter to {}", output_path.display());
+    fix_and_save_latex(out_dir, tex_filename, &mut cover_latex, completion_model, cache).await?;
 
     Ok(())
 }

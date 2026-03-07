@@ -128,7 +128,8 @@ Finish with an empty line."
             &assessment_prompt,
             "story_assessment",
             provider,
-        ).await?;
+            None,
+        ).await?.value;
 
         let computed_missing = missing_fields(&assessment.parsed_story);
         let mut missing_fields = assessment.missing_fields.clone();
@@ -191,6 +192,7 @@ Finish with an empty line."
     ))
 }
 
+#[tracing::instrument(skip_all)]
 pub async fn fill_skill_gaps<M: CompletionModel + Clone>(
     skill_assessment: &SkillFocusList,
     gap_threshold: i16,
