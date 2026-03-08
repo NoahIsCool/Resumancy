@@ -14,7 +14,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4.3"
 sha2 = "0.11.0-rc.5"
 schemars = "1.2.1"
-clap = { version = "4.5.60", features = ["derive"] }
+clap = { version = "4.5.60", features = ["derive", "env"] }
+indicatif = "0.17"
+console = "0.15"
+futures = "0.3"
+tracing = "0.1"
+opentelemetry = "0.30"
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.30", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.31"
+htmd = "0.5"
+rustyline = { version = "15", features = ["derive"] }
+dirs = "6"
+pdf_oxide = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
