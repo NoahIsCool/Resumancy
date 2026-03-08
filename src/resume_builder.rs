@@ -11,6 +11,21 @@ use crate::llm::{prompt_text_with_temperature, prompt_text_streaming, strip_code
 const MAX_LATEX_FIXES: usize = 3;
 const TOP_STORIES_PER_SKILL: usize = 50;
 
+const RESUME_TEMPLATE: &str = include_str!("../data/resume_template.tex");
+const COVER_LETTER_TEMPLATE: &str = include_str!("../data/cover_letter_template.tex");
+
+/// Load a LaTeX template: check `data_dir()/filename` for a user override,
+/// otherwise fall back to the embedded default.
+fn load_template(filename: &str, embedded: &str) -> String {
+    if let Ok(data_dir) = crate::paths::data_dir() {
+        let override_path = data_dir.join(filename);
+        if let Ok(contents) = fs::read_to_string(&override_path) {
+            return contents;
+        }
+    }
+    embedded.to_string()
+}
+
 struct LatexCompileResult {
     log: String,
     has_warning: bool,
@@ -235,8 +250,7 @@ pub async fn build_resume<M: CompletionModel + Clone>(
     let matched_stories = build_matched_stories_context(skill_assessment, embed_model).await?;
     let user_profile_context = format_user_profile(&user_profile);
 
-    let template = fs::read_to_string("data/resume_template.tex")
-        .context("failed to read resume template: data/resume_template.tex")?;
+    let template = load_template("resume_template.tex", RESUME_TEMPLATE);
 
     let resume_prompt = format!(
         "JOB DESCRIPTION:\n{}\n\nSKILL PRIORITIES:\n{}\n\nMATCHED STORIES:\n{}\n\nUSER PROFILE:\n{}\n\nSTARTER RESUME:\n{}\n\nTEMPLATE:\n{}\n",
@@ -317,8 +331,7 @@ pub async fn build_cover_letter<M: CompletionModel + Clone>(
     let matched_stories = build_matched_stories_context(skill_assessment, embed_model).await?;
     let user_profile_context = format_user_profile(user_profile);
 
-    let template = fs::read_to_string("data/cover_letter_template.tex")
-        .context("failed to read cover letter template: data/cover_letter_template.tex")?;
+    let template = load_template("cover_letter_template.tex", COVER_LETTER_TEMPLATE);
 
     let cover_letter_prompt = format!(
         "JOB DESCRIPTION:\n{}\n\nSKILL PRIORITIES:\n{}\n\nMATCHED STORIES:\n{}\n\nUSER PROFILE:\n{}\n\nTEMPLATE:\n{}\n",

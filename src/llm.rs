@@ -1,13 +1,43 @@
 use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
+use indicatif::{ProgressBar, ProgressStyle};
 use rig::completion::{AssistantContent, CompletionModel, Usage};
 use rig::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
 use rig::OneOrMany;
 use schemars::{schema_for, JsonSchema};
 use serde::de::DeserializeOwned;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{env, time::Duration};
 
 use crate::cache;
+
+static FANCY_UI: AtomicBool = AtomicBool::new(false);
+
+/// Enable spinner display during LLM calls. Call once at startup.
+pub fn enable_spinners(fancy: bool) {
+    FANCY_UI.store(fancy, Ordering::Relaxed);
+}
+
+fn llm_spinner(message: &str) -> Option<ProgressBar> {
+    if !FANCY_UI.load(Ordering::Relaxed) {
+        return None;
+    }
+    let bar = ProgressBar::new_spinner();
+    bar.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    bar.set_message(message.to_string());
+    bar.enable_steady_tick(Duration::from_millis(80));
+    Some(bar)
+}
+
+fn finish_spinner(spinner: Option<ProgressBar>) {
+    if let Some(bar) = spinner {
+        bar.finish_and_clear();
+    }
+}
 
 /// Combine two `Usage` values by summing their token counts.
 pub fn combine_usage(a: Usage, b: Usage) -> Usage {
@@ -542,10 +572,13 @@ where
         StructuredOutputStrategy::PromptOnly => {}
     }
 
+    let spinner = llm_spinner(&format!("Waiting for LLM ({schema_name})..."));
     let response = builder
         .send()
         .await
-        .context("structured prompt failed")?;
+        .context("structured prompt failed");
+    finish_spinner(spinner);
+    let response = response?;
 
     let usage = response.usage;
     span.record("llm.input_tokens", usage.input_tokens);
@@ -599,13 +632,16 @@ where
         return Ok(LlmOutput { value: cached, usage: Usage::default() });
     }
 
+    let spinner = llm_spinner("Waiting for LLM...");
     let response = model
         .completion_request(prompt)
         .preamble(preamble.to_string())
         .temperature(temperature)
         .send()
         .await
-        .context("prompt failed")?;
+        .context("prompt failed");
+    finish_spinner(spinner);
+    let response = response?;
 
     let usage = response.usage;
     span.record("llm.input_tokens", usage.input_tokens);
@@ -649,13 +685,17 @@ where
 
     use futures::StreamExt;
 
-    let mut stream = model
+    let spinner = llm_spinner("Waiting for LLM stream...");
+    let stream_result = model
         .completion_request(prompt)
         .preamble(preamble.to_string())
         .temperature(temperature)
         .stream()
         .await
-        .context("streaming prompt failed")?;
+        .context("streaming prompt failed");
+    // Clear spinner before streaming begins (stream setup is the wait)
+    finish_spinner(spinner);
+    let mut stream = stream_result?;
 
     let mut accumulated = String::new();
 

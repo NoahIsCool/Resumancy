@@ -1,12 +1,10 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-
-const DEFAULT_CACHE_DIR: &str = "data/cache";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheEntry {
@@ -39,12 +37,8 @@ pub fn cache_key(
     hex::encode(hasher.finalize())
 }
 
-fn default_cache_dir() -> PathBuf {
-    Path::new(DEFAULT_CACHE_DIR).to_path_buf()
-}
-
 pub fn get_cached(key: &str, max_age: Option<std::time::Duration>) -> Result<Option<String>> {
-    get_cached_at(&default_cache_dir(), key, max_age)
+    get_cached_at(&crate::paths::cache_dir()?, key, max_age)
 }
 
 pub fn get_cached_at(cache_dir: &Path, key: &str, max_age: Option<std::time::Duration>) -> Result<Option<String>> {
@@ -70,7 +64,7 @@ pub fn get_cached_at(cache_dir: &Path, key: &str, max_age: Option<std::time::Dur
 }
 
 pub fn set_cached(key: &str, text: &str) -> Result<()> {
-    set_cached_at(&default_cache_dir(), key, text)
+    set_cached_at(&crate::paths::cache_dir()?, key, text)
 }
 
 pub fn set_cached_at(cache_dir: &Path, key: &str, text: &str) -> Result<()> {

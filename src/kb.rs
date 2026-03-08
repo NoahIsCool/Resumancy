@@ -1,12 +1,12 @@
-use std::{fs, io};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use anyhow::{anyhow, Context};
+use std::fs;
+use std::io;
+use std::path::Path;
+use anyhow::Context;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const DEFAULT_KB_PATH: &str = "data/user_skills.json";
+use crate::input::InputEditor;
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
 #[schemars(deny_unknown_fields)]
@@ -81,7 +81,7 @@ pub fn story_document(company: &str, year: &str, text: &str) -> String {
     format!("{company} ({year}): {text}")
 }
 
-fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
+pub fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
@@ -99,7 +99,7 @@ pub async fn retrieve_relevant_stories(
     top_n: usize,
     embed_model: &impl rig::embeddings::EmbeddingModel,
 ) -> anyhow::Result<Vec<Story>> {
-    retrieve_relevant_stories_at(&default_kb_path(), query, top_n, embed_model).await
+    retrieve_relevant_stories_at(&crate::paths::kb_path()?, query, top_n, embed_model).await
 }
 
 pub async fn retrieve_relevant_stories_at(
@@ -141,47 +141,74 @@ pub fn story_id(company: &str, year: &str, text: &str) -> String {
     format!("story_{}", hex::encode(hasher.finalize()))
 }
 
-fn default_kb_path() -> PathBuf {
-    Path::new(DEFAULT_KB_PATH).to_path_buf()
+/// Find stories whose embedding is above `threshold` similarity to `query_vec`.
+/// Returns `(index, similarity, story)` triples sorted by similarity descending.
+pub fn find_similar_stories<'a>(store: &'a UserSkillStore, query_vec: &[f64], threshold: f64) -> Vec<(usize, f64, &'a Story)> {
+    let mut results: Vec<(usize, f64, &Story)> = store
+        .skills
+        .iter()
+        .enumerate()
+        .map(|(i, story)| {
+            let sim = cosine_similarity(query_vec, &story.vector);
+            (i, sim, story)
+        })
+        .filter(|(_, sim, _)| *sim >= threshold)
+        .collect();
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results
 }
 
-fn read_required_line(prompt: &str) -> anyhow::Result<String> {
-    loop {
-        print!("{prompt}");
-        io::stdout().flush().ok();
-        let mut line = String::new();
-        let bytes = io::stdin().read_line(&mut line)?;
-        if bytes == 0 {
-            return Err(anyhow!("stdin closed while reading input"));
-        }
-        let value = line.trim_end_matches(&['\r', '\n'][..]).to_string();
-        if !value.trim().is_empty() {
-            return Ok(value);
-        }
-        println!("Value cannot be empty.");
-    }
+/// Replace the story at `index` with new content and re-embed.
+pub async fn update_story(
+    index: usize,
+    story: StorySeed,
+    embed_model: &impl rig::embeddings::EmbeddingModel,
+) -> anyhow::Result<()> {
+    update_story_at(&crate::paths::kb_path()?, index, story, embed_model).await
 }
 
-fn read_optional_line(prompt: &str) -> anyhow::Result<Option<String>> {
-    print!("{prompt}");
-    io::stdout().flush().ok();
-    let mut line = String::new();
-    let bytes = io::stdin().read_line(&mut line)?;
-    if bytes == 0 {
-        return Ok(None);
+pub async fn update_story_at(
+    path: &Path,
+    index: usize,
+    story: StorySeed,
+    embed_model: &impl rig::embeddings::EmbeddingModel,
+) -> anyhow::Result<()> {
+    let mut store = load_kb_at(path)?;
+    if index >= store.skills.len() {
+        return Err(anyhow::anyhow!("story index {} out of range ({})", index, store.skills.len()));
     }
-    let value = line.trim_end_matches(&['\r', '\n'][..]).to_string();
-    if value.trim().is_empty() {
-        return Ok(None);
+    let document = story_document(&story.company, &story.year, &story.text);
+    let embedding = embed_model.embed_text(&document).await?;
+    store.skills[index] = Story {
+        company: story.company,
+        year: story.year,
+        text: story.text,
+        vector: embedding.vec,
+    };
+    save_kb_at(path, &store)?;
+    Ok(())
+}
+
+/// Remove the story at `index`.
+pub fn remove_story(index: usize) -> anyhow::Result<()> {
+    remove_story_at(&crate::paths::kb_path()?, index)
+}
+
+pub fn remove_story_at(path: &Path, index: usize) -> anyhow::Result<()> {
+    let mut store = load_kb_at(path)?;
+    if index >= store.skills.len() {
+        return Err(anyhow::anyhow!("story index {} out of range ({})", index, store.skills.len()));
     }
-    Ok(Some(value))
+    store.skills.remove(index);
+    save_kb_at(path, &store)?;
+    Ok(())
 }
 
 pub async fn add_story_to_store(
     story: StorySeed,
     embed_model: &impl rig::embeddings::EmbeddingModel,
 ) -> anyhow::Result<()> {
-    add_story_to_store_at(&default_kb_path(), story, embed_model).await
+    add_story_to_store_at(&crate::paths::kb_path()?, story, embed_model).await
 }
 
 pub async fn add_story_to_store_at(
@@ -205,7 +232,7 @@ pub async fn add_story_to_store_at(
 }
 
 pub fn load_kb() -> anyhow::Result<UserSkillStore> {
-    load_kb_at(&default_kb_path())
+    load_kb_at(&crate::paths::kb_path()?)
 }
 
 pub fn load_kb_at(path: &Path) -> anyhow::Result<UserSkillStore> {
@@ -225,7 +252,7 @@ pub fn load_kb_at(path: &Path) -> anyhow::Result<UserSkillStore> {
 }
 
 pub fn save_kb(store: &UserSkillStore) -> anyhow::Result<()> {
-    save_kb_at(&default_kb_path(), store)
+    save_kb_at(&crate::paths::kb_path()?, store)
 }
 
 pub fn save_kb_at(path: &Path, store: &UserSkillStore) -> anyhow::Result<()> {
@@ -241,7 +268,7 @@ pub fn save_kb_at(path: &Path, store: &UserSkillStore) -> anyhow::Result<()> {
 }
 
 pub fn list_story_documents() -> anyhow::Result<Vec<String>> {
-    list_story_documents_at(&default_kb_path())
+    list_story_documents_at(&crate::paths::kb_path()?)
 }
 
 pub fn list_story_documents_at(path: &Path) -> anyhow::Result<Vec<String>> {
@@ -254,12 +281,12 @@ pub fn list_story_documents_at(path: &Path) -> anyhow::Result<Vec<String>> {
     Ok(documents)
 }
 
-pub fn get_or_build_user_profile() -> anyhow::Result<UserProfile> {
+pub fn get_or_build_user_profile(editor: &mut InputEditor) -> anyhow::Result<UserProfile> {
     match get_user_profile()? {
         Some(profile) => Ok(profile),
         None => {
             println!("\nNo user profile found in knowledge base. Let's add it.");
-            let profile = collect_user_profile()?;
+            let profile = collect_user_profile(editor)?;
             set_user_profile(profile.clone())?;
             Ok(profile)
         }
@@ -267,7 +294,7 @@ pub fn get_or_build_user_profile() -> anyhow::Result<UserProfile> {
 }
 
 pub fn get_user_profile() -> anyhow::Result<Option<UserProfile>> {
-    get_user_profile_at(&default_kb_path())
+    get_user_profile_at(&crate::paths::kb_path()?)
 }
 
 pub fn get_user_profile_at(path: &Path) -> anyhow::Result<Option<UserProfile>> {
@@ -275,28 +302,28 @@ pub fn get_user_profile_at(path: &Path) -> anyhow::Result<Option<UserProfile>> {
     Ok(store.user_profile)
 }
 
-fn collect_user_profile() -> anyhow::Result<UserProfile> {
+fn collect_user_profile(editor: &mut InputEditor) -> anyhow::Result<UserProfile> {
     println!("\n=== User profile ===");
-    let name = read_required_line("Full name: ")?;
-    let location = read_required_line("Location: ")?;
-    let email = read_required_line("Email: ")?;
-    let phone = read_required_line("Phone number: ")?;
+    let name = editor.read_required_line("Full name: ")?;
+    let location = editor.read_required_line("Location: ")?;
+    let email = editor.read_required_line("Email: ")?;
+    let phone = editor.read_required_line("Phone number: ")?;
 
     println!("\n--- Relevant links (e.g., GitHub, LinkedIn) ---");
     let mut links = Vec::new();
     loop {
-        let label = read_optional_line("Link label (blank to finish): ")?;
+        let label = editor.read_line("Link label (blank to finish): ")?;
         let Some(label) = label else { break };
-        let url = read_required_line(&format!("URL for {}: ", label))?;
+        let url = editor.read_required_line(&format!("URL for {}: ", label))?;
         links.push(ProfileLink { label, url });
     }
 
     println!("\n--- Education ---");
     let mut education = Vec::new();
     loop {
-        let degree = read_optional_line("Degree title (blank to finish): ")?;
+        let degree = editor.read_line("Degree title (blank to finish): ")?;
         let Some(degree) = degree else { break };
-        let graduation_date = read_required_line("Graduation date: ")?;
+        let graduation_date = editor.read_required_line("Graduation date: ")?;
         education.push(EducationEntry {
             degree,
             graduation_date,
@@ -306,12 +333,12 @@ fn collect_user_profile() -> anyhow::Result<UserProfile> {
     println!("\n--- Job history ---");
     let mut jobs = Vec::new();
     loop {
-        let company = read_optional_line("Company name (blank to finish): ")?;
+        let company = editor.read_line("Company name (blank to finish): ")?;
         let Some(company) = company else { break };
-        let title = read_required_line("Job title: ")?;
-        let job_location = read_required_line("Job location: ")?;
-        let start_date = read_required_line("Start date: ")?;
-        let end_date = read_required_line("End date (or Present): ")?;
+        let title = editor.read_required_line("Job title: ")?;
+        let job_location = editor.read_required_line("Job location: ")?;
+        let start_date = editor.read_required_line("Start date: ")?;
+        let end_date = editor.read_required_line("End date (or Present): ")?;
         jobs.push(JobEntry {
             company,
             title,
@@ -333,7 +360,7 @@ fn collect_user_profile() -> anyhow::Result<UserProfile> {
 }
 
 pub fn set_user_profile(profile: UserProfile) -> anyhow::Result<()> {
-    set_user_profile_at(&default_kb_path(), profile)
+    set_user_profile_at(&crate::paths::kb_path()?, profile)
 }
 
 pub fn set_user_profile_at(path: &Path, profile: UserProfile) -> anyhow::Result<()> {

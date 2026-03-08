@@ -29,13 +29,17 @@ pub struct SkillFocusList {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
-#[schemars(deny_unknown_fields)]
 pub struct SkillNeed {
     pub title: String, // title of the skill
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
     pub need: u8, //ranking from 0-9 of how necessary the skill is
+    #[serde(default)]
     pub suitability: u8, // a ranking from 0-9 of how well the candidate satisfies requirement
+    #[serde(default)]
     pub skill_description: String, // short description of the skill area.
+    #[serde(default)]
     pub justification: String, // a short justification of the candidate's ranking in this skill area.
 }
 
@@ -77,6 +81,7 @@ pub async fn evaluate_candidate<M: CompletionModel + Clone>(
 
 
     let kb = load_kb()?;
+    eprintln!("Evaluating candidate against {} KB stories...", kb.skills.len());
     let stories_context = kb.skills
         .iter()
         .map(|skill| format!("- {} ({}): {}", skill.company, skill.year, skill.text))
@@ -117,7 +122,23 @@ pub async fn evaluate_candidate<M: CompletionModel + Clone>(
         cache,
     ).await?;
 
-    Ok((result.value, combine_usage(usage1, result.usage)))
+    // Backfill fields the LLM was supposed to copy verbatim from JobNeeds
+    let mut focus_list: SkillFocusList = result.value;
+    for skill in &mut focus_list.skills {
+        if let Some(original) = job_needs.skills.iter().find(|n| n.title == skill.title) {
+            if skill.need == 0 {
+                skill.need = original.need;
+            }
+            if skill.description.is_empty() {
+                skill.description.clone_from(&original.description);
+            }
+            if skill.skill_description.is_empty() {
+                skill.skill_description.clone_from(&original.skill_description);
+            }
+        }
+    }
+
+    Ok((focus_list, combine_usage(usage1, result.usage)))
 }
 
 #[cfg(test)]
@@ -169,6 +190,21 @@ mod tests {
         assert_eq!(list.skills.len(), 1);
         assert_eq!(list.skills[0].need, 9);
         assert_eq!(list.skills[0].suitability, 7);
+    }
+
+    #[test]
+    fn skill_need_deserializes_with_missing_fields() {
+        let json = r#"{
+            "title": "Rust",
+            "suitability": 5,
+            "justification": "Some experience"
+        }"#;
+        let skill: SkillNeed = serde_json::from_str(json).expect("parse");
+        assert_eq!(skill.title, "Rust");
+        assert_eq!(skill.need, 0);
+        assert_eq!(skill.suitability, 5);
+        assert!(skill.description.is_empty());
+        assert!(skill.skill_description.is_empty());
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context};
 use rig::completion::CompletionModel;
 use pipelines::batch;
+use pipelines::input::InputEditor;
 use pipelines::llm::{Provider, CacheConfig};
 use pipelines::stats::StatsCollector;
 use pipelines::ui::Ui;
@@ -133,6 +134,7 @@ async fn run_pipeline<M, E>(
     ui: &Ui,
     stats: &StatsCollector,
     cache: &CacheConfig,
+    editor: &mut InputEditor,
 ) -> anyhow::Result<()>
 where
     M: CompletionModel + Clone,
@@ -142,11 +144,10 @@ where
 
     ui.header("Analyzing job posting");
 
-    let spinner = ui.spinner(&format!("Requesting job needs from {}...", model_name));
     let timer = stats.start_timer();
     let (skill_assessment, eval_usage) = hiring_manager::evaluate_candidate(job_text, completion_model, provider, cache_opt).await?;
     stats.record_with_usage("evaluate_candidate", model_name, eval_usage, timer.elapsed());
-    spinner.finish("Job analysis complete");
+    ui.success("Job analysis complete");
 
     if skill_assessment.skills.is_empty() {
         ui.success("No skill gaps detected from the posting and existing evidence.");
@@ -164,19 +165,13 @@ where
 
         ui.header("Coaching on skill gaps");
         let timer = stats.start_timer();
-        resume_coach::fill_skill_gaps(&skill_assessment, gap_threshold, related_skills, completion_model, embed_model, provider).await?;
+        resume_coach::fill_skill_gaps(&skill_assessment, gap_threshold, related_skills, completion_model, embed_model, provider, editor).await?;
         stats.record_with_usage("skill_coaching", model_name, rig::completion::Usage::default(), timer.elapsed());
     }
 
-    let user_profile = kb::get_or_build_user_profile()?;
+    let user_profile = kb::get_or_build_user_profile(editor)?;
 
-    // Resume generation — use streaming or spinner
-    let spinner = if stream {
-        ui.header("Generating resume");
-        None
-    } else {
-        Some(ui.spinner("Building tailored resume..."))
-    };
+    ui.header("Generating resume");
 
     let timer = stats.start_timer();
     let (evaluation, resume_usage) = resume_builder::build_resume(
@@ -193,12 +188,7 @@ where
         cache_opt,
     ).await?;
     stats.record_with_usage("build_resume", model_name, resume_usage, timer.elapsed());
-
-    if let Some(s) = spinner {
-        s.finish("Resume generated");
-    } else {
-        ui.success("Resume generated");
-    }
+    ui.success("Resume generated");
 
     if let Some(eval) = &evaluation {
         ui.header("Resume Evaluation");
@@ -218,12 +208,7 @@ where
     }
 
     if cover_letter {
-        let cl_spinner = if stream {
-            ui.header("Writing cover letter");
-            None
-        } else {
-            Some(ui.spinner("Writing cover letter..."))
-        };
+        ui.header("Writing cover letter");
 
         let timer = stats.start_timer();
         let cl_usage = resume_builder::build_cover_letter(
@@ -238,12 +223,7 @@ where
             cache_opt,
         ).await?;
         stats.record_with_usage("cover_letter", model_name, cl_usage, timer.elapsed());
-
-        if let Some(s) = cl_spinner {
-            s.finish("Cover letter generated");
-        } else {
-            ui.success("Cover letter generated");
-        }
+        ui.success("Cover letter generated");
     }
 
     Ok(())
@@ -259,9 +239,10 @@ async fn dispatch_pipeline(
     ui: &Ui,
     stats: &StatsCollector,
     cache: &CacheConfig,
+    editor: &mut InputEditor,
 ) -> anyhow::Result<()> {
     pipelines::dispatch_provider!(args.provider, model_name, args.embedding_model.clone(), |m, e| {
-        run_pipeline(job_text, out_dir, model_name, &m, &e, args.provider, args.cover_letter, args.eval, args.stream, gap_threshold, args.related_skills, ui, stats, cache).await
+        run_pipeline(job_text, out_dir, model_name, &m, &e, args.provider, args.cover_letter, args.eval, args.stream, gap_threshold, args.related_skills, ui, stats, cache, editor).await
     })
 }
 
@@ -271,8 +252,14 @@ async fn main() -> anyhow::Result<()> {
 
     let tracer_provider = init_tracing(args.trace);
 
-    let ui = Ui::new(console::Term::stderr().is_term());
+    let is_tty = console::Term::stderr().is_term();
+    let ui = Ui::new(is_tty);
+    pipelines::llm::enable_spinners(is_tty);
     let stats = StatsCollector::new(args.stats);
+
+    let data_dir = pipelines::paths::data_dir()?;
+    pipelines::paths::ensure_dir(&data_dir)?;
+    pipelines::paths::ensure_dir(&pipelines::paths::cache_dir()?)?;
 
     let model_name = args.model.clone()
         .unwrap_or_else(|| args.provider.default_model().to_string());
@@ -284,11 +271,20 @@ async fn main() -> anyhow::Result<()> {
         max_age: args.cache_ttl.map(std::time::Duration::from_secs),
     };
 
+    ui.detail("Data dir", &data_dir.display().to_string());
     ui.detail("Provider", &format!("{:?}", args.provider));
     ui.detail("Model", &model_name);
     if cache.enabled {
         ui.detail("Cache", "enabled");
     }
+
+    let kb_file = pipelines::paths::kb_path()?;
+    if !kb_file.exists() {
+        ui.warn("No knowledge base found. Run `build_kb` first to bootstrap from your resume:");
+        ui.detail("", "cargo run --bin build_kb -- <resume.pdf|resume.md>");
+    }
+
+    let mut editor = InputEditor::new()?;
 
     let result = if args.job_path.is_dir() {
         // ── Batch mode ──────────────────────────────────────────────
@@ -329,7 +325,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let job_text = job_raw.split_whitespace().collect::<Vec<_>>().join(" ");
 
-            match dispatch_pipeline(&args, &job_text, &out_dir, &model_name, args.gap_threshold, &ui, &stats, &cache).await {
+            match dispatch_pipeline(&args, &job_text, &out_dir, &model_name, args.gap_threshold, &ui, &stats, &cache, &mut editor).await {
                 Ok(()) => ui.success(&format!("Done  -> {}", out_dir.display())),
                 Err(e) => {
                     ui.error(&format!("Failed: {}", e));
@@ -356,7 +352,7 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("failed to read file: {}", args.job_path.display()))?;
         let job_text = job_raw.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        dispatch_pipeline(&args, &job_text, &args.out, &model_name, args.gap_threshold, &ui, &stats, &cache).await
+        dispatch_pipeline(&args, &job_text, &args.out, &model_name, args.gap_threshold, &ui, &stats, &cache, &mut editor).await
     };
 
     if stats.enabled() {
